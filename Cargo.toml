@@ -1,0 +1,26 @@
+[package]
+name = "better-rune-derive"
+version = "0.1.0"
+authors = ["John-John Tedro <udoprog@tedro.se>", "ModProg", "atampy25"]
+edition = "2021"
+rust-version = "1.65"
+description = "A better Any derive macro for Rune."
+documentation = "https://docs.rs/rune"
+readme = "README.md"
+homepage = "https://github.com/rune-rs/rune"
+repository = "https://github.com/rune-rs/rune"
+license = "MIT OR Apache-2.0"
+keywords = ["language", "scripting", "scripting-language"]
+categories = ["parser-implementations"]
+
+[dependencies]
+rune-core = "0.13.4"
+syn = { version = "2.0.16", features = ["full"] }
+quote = "1.0.27"
+proc-macro2 = { version = "1.0.56", features = ["span-locations"] }
+
+[lib]
+proc-macro = true
+
+[dev-dependencies]
+rune = "0.13.4"
