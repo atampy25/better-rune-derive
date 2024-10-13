@@ -3,7 +3,8 @@ use std::cell::RefCell;
 use crate::internals::*;
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
-use quote::{quote, quote_spanned, ToTokens};
+use quote::quote_spanned;
+use quote::{quote, ToTokens};
 use syn::parse::Parse;
 use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
@@ -19,9 +20,9 @@ pub(crate) struct FieldAttrs {
     /// `#[rune(iter)]`
     pub(crate) iter: Option<Span>,
     /// `#[rune(skip)]`
-    skip: Option<Span>,
-    /// `#[rune(optional)]`
-    pub(crate) optional: Option<Span>,
+    pub(crate) skip: Option<Span>,
+    /// `#[rune(option)]`
+    pub(crate) option: Option<Span>,
     /// `#[rune(meta)]`
     pub(crate) meta: Option<Span>,
     /// A single field marked with `#[rune(span)]`.
@@ -76,10 +77,19 @@ pub(crate) struct TypeAttr {
     pub(crate) constructor: bool,
     /// Protocols to "derive"
     pub(crate) protocols: Vec<TypeProtocol>,
-    /// Assosiated functions
+    /// Associated functions
     pub(crate) functions: Vec<syn::Path>,
     /// Parsed documentation.
     pub(crate) docs: Vec<syn::Expr>,
+    /// Indicates that this is a builtin type, so don't generate an `Any`
+    /// implementation for it.
+    pub(crate) builtin: Option<Span>,
+    /// Indicate a static type to use.
+    pub(crate) static_type: Option<syn::Ident>,
+    /// Method to use to convert from value.
+    pub(crate) from_value: Option<syn::Path>,
+    /// Method to use to convert from value.
+    pub(crate) from_value_params: Option<syn::punctuated::Punctuated<syn::Type, Token![,]>>,
 }
 
 /// Parsed variant attributes.
@@ -135,15 +145,17 @@ impl TypeProtocol {
                 module.associated_function(rune::runtime::Protocol::ADD, |this: Self, other: Self| this + other)?;
             },
             "STRING_DISPLAY" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::STRING_DISPLAY, |this: &Self, buf: &mut ::std::string::String| {
-                    use ::core::fmt::Write as _;
-                    ::core::write!(buf, "{this}")
+                module.associated_function(rune::runtime::Protocol::STRING_DISPLAY, |this: &Self, f: &mut rune::runtime::Formatter| {
+                    use rune::alloc::fmt::TryWrite;
+                    rune::vm_write!(f, "{}", this);
+                    rune::runtime::VmResult::Ok(())
                 })?;
             },
             "STRING_DEBUG" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::STRING_DEBUG, |this: &Self, buf: &mut ::std::string::String| {
-                    use ::core::fmt::Write as _;
-                    ::core::write!(buf, "{this:?}")
+                module.associated_function(rune::runtime::Protocol::STRING_DEBUG, |this: &Self, f: &mut rune::runtime::Formatter| {
+                    use rune::alloc::fmt::TryWrite;
+                    rune::vm_write!(f, "{:?}", this);
+                    rune::runtime::VmResult::Ok(())
                 })?;
             },
             _ => unreachable!("`parse()` ensures only supported protocols"),
@@ -207,6 +219,11 @@ impl Context {
     /// Register an error.
     pub(crate) fn error(&self, error: syn::Error) {
         self.errors.borrow_mut().push(error)
+    }
+
+    /// Test if context has any errors.
+    pub(crate) fn has_errors(&self) -> bool {
+        !self.errors.borrow().is_empty()
     }
 
     /// Get a field identifier.
@@ -287,9 +304,9 @@ impl Context {
                 } else if meta.path == SKIP {
                     // `#[rune(skip)]`.
                     attr.skip = Some(meta.path.span());
-                } else if meta.path == OPTIONAL {
-                    // `#[rune(optional)]`.
-                    attr.optional = Some(meta.path.span());
+                } else if meta.path == OPTION {
+                    // `#[rune(option)]`.
+                    attr.option = Some(meta.path.span());
                 } else if meta.path == META {
                     // `#[rune(meta)]`.
                     attr.meta = Some(meta.path.span());
@@ -514,7 +531,6 @@ impl Context {
                                 "Unsupported type attribute",
                             ));
                         }
-
                         Ok(())
                     });
 
@@ -613,115 +629,6 @@ impl Context {
         Ok(Some(parse_path_compat(input)?))
     }
 
-    /// Build an inner spanned decoder from an iterator.
-    pub(crate) fn build_spanned_iter<'a>(
-        &self,
-        tokens: &Tokens,
-        back: bool,
-        mut it: impl Iterator<Item = (Result<TokenStream, ()>, &'a syn::Field)>,
-    ) -> Result<(bool, Option<TokenStream>), ()> {
-        let mut quote = None::<TokenStream>;
-
-        loop {
-            let (var, field) = match it.next() {
-                Some((var, field)) => (var?, field),
-                None => {
-                    return Ok((true, quote));
-                }
-            };
-
-            let attrs = self.field_attrs(&field.attrs)?;
-
-            let spanned = &tokens.spanned;
-
-            if attrs.skip() {
-                continue;
-            }
-
-            if attrs.optional.is_some() {
-                let option_spanned = &tokens.option_spanned;
-                let next = quote_spanned! {
-                    field.span() => #option_spanned::option_span(#var)
-                };
-
-                if quote.is_some() {
-                    quote = Some(quote_spanned! {
-                        field.span() => #quote.or_else(|| #next)
-                    });
-                } else {
-                    quote = Some(next);
-                }
-
-                continue;
-            }
-
-            if attrs.iter.is_some() {
-                let next = if back {
-                    quote_spanned!(field.span() => next_back)
-                } else {
-                    quote_spanned!(field.span() => next)
-                };
-
-                let spanned = &tokens.spanned;
-                let next = quote_spanned! {
-                    field.span() => IntoIterator::into_iter(#var).#next().map(#spanned::span)
-                };
-
-                if quote.is_some() {
-                    quote = Some(quote_spanned! {
-                        field.span() => #quote.or_else(|| #next)
-                    });
-                } else {
-                    quote = Some(next);
-                }
-
-                continue;
-            }
-
-            if quote.is_some() {
-                quote = Some(quote_spanned! {
-                    field.span() => #quote.unwrap_or_else(|| #spanned::span(#var))
-                });
-            } else {
-                quote = Some(quote_spanned! {
-                    field.span() => #spanned::span(#var)
-                });
-            }
-
-            return Ok((false, quote));
-        }
-    }
-
-    /// Explicit span for fields.
-    pub(crate) fn explicit_span(
-        &self,
-        named: &syn::FieldsNamed,
-    ) -> Result<Option<TokenStream>, ()> {
-        let mut explicit_span = None;
-
-        for field in &named.named {
-            let attrs = self.field_attrs(&field.attrs)?;
-
-            if let Some(span) = attrs.span {
-                if explicit_span.is_some() {
-                    self.error(syn::Error::new(
-                        span,
-                        "Only one field can be marked `#[rune(span)]`",
-                    ));
-                    return Err(());
-                }
-
-                let ident = &field.ident;
-
-                explicit_span = Some(quote_spanned! {
-                    field.span() => self.#ident
-                });
-            }
-        }
-
-        Ok(explicit_span)
-    }
-
     pub(crate) fn tokens_with_module(&self, module: Option<&syn::Path>) -> Tokens {
         let mut core = syn::Path {
             leading_colon: Some(<Token![::]>::default()),
@@ -729,6 +636,15 @@ impl Context {
         };
         core.segments.push(syn::PathSegment::from(syn::Ident::new(
             "core",
+            Span::call_site(),
+        )));
+
+        let mut alloc = syn::Path {
+            leading_colon: Some(<Token![::]>::default()),
+            segments: Punctuated::default(),
+        };
+        alloc.segments.push(syn::PathSegment::from(syn::Ident::new(
+            "alloc",
             Span::call_site(),
         )));
 
@@ -754,46 +670,62 @@ impl Context {
         Tokens {
             any_type_info: path(m, ["runtime", "AnyTypeInfo"]),
             any: path(m, ["Any"]),
+            box_: path(m, ["__private", "Box"]),
+            vec: path(m, ["alloc", "Vec"]),
+            clone: path(&core, ["clone", "Clone"]),
             compile_error: path(m, ["compile", "Error"]),
             context_error: path(m, ["compile", "ContextError"]),
+            double_ended_iterator: path(&core, ["iter", "DoubleEndedIterator"]),
             from_value: path(m, ["runtime", "FromValue"]),
             full_type_of: path(m, ["runtime", "FullTypeOf"]),
             hash: path(m, ["Hash"]),
             id: path(m, ["parse", "Id"]),
             install_with: path(m, ["__private", "InstallWith"]),
+            into_iterator: path(&core, ["iter", "IntoIterator"]),
+            iterator: path(&core, ["iter", "Iterator"]),
             macro_context: path(m, ["macros", "MacroContext"]),
             maybe_type_of: path(m, ["runtime", "MaybeTypeOf"]),
             module: path(m, ["__private", "Module"]),
+            mut_: path(m, ["runtime", "Mut"]),
             named: path(m, ["compile", "Named"]),
+            non_null: path(&core, ["ptr", "NonNull"]),
             object: path(m, ["runtime", "Object"]),
             opaque: path(m, ["parse", "Opaque"]),
             option_spanned: path(m, ["ast", "OptionSpanned"]),
+            option: path(&core, ["option", "Option"]),
+            owned_tuple: path(m, ["runtime", "OwnedTuple"]),
             parse: path(m, ["parse", "Parse"]),
             parser: path(m, ["parse", "Parser"]),
             pointer_guard: path(m, ["runtime", "SharedPointerGuard"]),
             protocol: path(m, ["runtime", "Protocol"]),
             raw_into_mut: path(m, ["runtime", "RawMut"]),
             raw_into_ref: path(m, ["runtime", "RawRef"]),
+            raw_mut: path(m, ["runtime", "RawMut"]),
+            raw_ref: path(m, ["runtime", "RawRef"]),
             raw_str: path(m, ["runtime", "RawStr"]),
+            ref_: path(m, ["runtime", "Ref"]),
             result: path(&core, ["result", "Result"]),
             shared: path(m, ["runtime", "Shared"]),
             span: path(m, ["ast", "Span"]),
             spanned: path(m, ["ast", "Spanned"]),
+            static_type_mod: path(m, ["runtime", "static_type"]),
+            string: path(m, ["alloc", "String"]),
             to_tokens: path(m, ["macros", "ToTokens"]),
             to_value: path(m, ["runtime", "ToValue"]),
             token_stream: path(m, ["macros", "TokenStream"]),
-            try_result: path(m, ["runtime", "try_result"]),
+            try_from: path(&core, ["convert", "TryFrom"]),
             tuple: path(m, ["runtime", "Tuple"]),
             type_info: path(m, ["runtime", "TypeInfo"]),
             type_name: path(&core, ["any", "type_name"]),
             type_of: path(m, ["runtime", "TypeOf"]),
-            unit_struct: path(m, ["runtime", "UnitStruct"]),
-            unsafe_from_value: path(m, ["runtime", "UnsafeFromValue"]),
+            unsafe_to_mut: path(m, ["runtime", "UnsafeToMut"]),
+            unsafe_to_ref: path(m, ["runtime", "UnsafeToRef"]),
             unsafe_to_value: path(m, ["runtime", "UnsafeToValue"]),
             value: path(m, ["runtime", "Value"]),
             variant_data: path(m, ["runtime", "VariantData"]),
-            vm_error: path(m, ["runtime", "VmError"]),
             vm_result: path(m, ["runtime", "VmResult"]),
+            vm_try: path(m, ["vm_try"]),
+            alloc: path(m, ["alloc"]),
         }
     }
 }
@@ -830,46 +762,62 @@ fn path<const N: usize>(base: &syn::Path, path: [&'static str; N]) -> syn::Path 
 pub(crate) struct Tokens {
     pub(crate) any_type_info: syn::Path,
     pub(crate) any: syn::Path,
+    pub(crate) box_: syn::Path,
+    pub(crate) vec: syn::Path,
+    pub(crate) clone: syn::Path,
     pub(crate) compile_error: syn::Path,
     pub(crate) context_error: syn::Path,
+    pub(crate) double_ended_iterator: syn::Path,
     pub(crate) from_value: syn::Path,
     pub(crate) full_type_of: syn::Path,
     pub(crate) hash: syn::Path,
     pub(crate) id: syn::Path,
     pub(crate) install_with: syn::Path,
+    pub(crate) into_iterator: syn::Path,
+    pub(crate) iterator: syn::Path,
     pub(crate) macro_context: syn::Path,
     pub(crate) maybe_type_of: syn::Path,
     pub(crate) module: syn::Path,
+    pub(crate) mut_: syn::Path,
     pub(crate) named: syn::Path,
+    pub(crate) non_null: syn::Path,
     pub(crate) object: syn::Path,
     pub(crate) opaque: syn::Path,
     pub(crate) option_spanned: syn::Path,
+    pub(crate) option: syn::Path,
+    pub(crate) owned_tuple: syn::Path,
     pub(crate) parse: syn::Path,
     pub(crate) parser: syn::Path,
     pub(crate) pointer_guard: syn::Path,
     pub(crate) protocol: syn::Path,
     pub(crate) raw_into_mut: syn::Path,
     pub(crate) raw_into_ref: syn::Path,
+    pub(crate) raw_mut: syn::Path,
+    pub(crate) raw_ref: syn::Path,
     pub(crate) raw_str: syn::Path,
+    pub(crate) ref_: syn::Path,
     pub(crate) result: syn::Path,
     pub(crate) shared: syn::Path,
     pub(crate) span: syn::Path,
     pub(crate) spanned: syn::Path,
+    pub(crate) static_type_mod: syn::Path,
+    pub(crate) string: syn::Path,
     pub(crate) to_tokens: syn::Path,
     pub(crate) to_value: syn::Path,
     pub(crate) token_stream: syn::Path,
-    pub(crate) try_result: syn::Path,
+    pub(crate) try_from: syn::Path,
     pub(crate) tuple: syn::Path,
     pub(crate) type_info: syn::Path,
     pub(crate) type_name: syn::Path,
     pub(crate) type_of: syn::Path,
-    pub(crate) unit_struct: syn::Path,
-    pub(crate) unsafe_from_value: syn::Path,
+    pub(crate) unsafe_to_mut: syn::Path,
+    pub(crate) unsafe_to_ref: syn::Path,
     pub(crate) unsafe_to_value: syn::Path,
     pub(crate) value: syn::Path,
     pub(crate) variant_data: syn::Path,
-    pub(crate) vm_error: syn::Path,
     pub(crate) vm_result: syn::Path,
+    pub(crate) vm_try: syn::Path,
+    pub(crate) alloc: syn::Path,
 }
 
 impl Tokens {
@@ -877,19 +825,5 @@ impl Tokens {
     pub(crate) fn protocol(&self, sym: Symbol) -> TokenStream {
         let protocol = &self.protocol;
         quote!(#protocol::#sym)
-    }
-
-    /// Expand a `vm_try!` expression.
-    pub(crate) fn vm_try(&self, expr: impl ToTokens) -> impl ToTokens {
-        let vm_result = &self.vm_result;
-        let vm_error = &self.vm_error;
-        let try_result = &self.try_result;
-
-        quote! {
-            match #try_result(#expr) {
-                #vm_result::Ok(value) => value,
-                #vm_result::Err(err) => return #vm_result::Err(#vm_error::from(err)),
-            }
-        }
     }
 }
