@@ -23,6 +23,7 @@ pub const MODULE: Symbol = Symbol("module");
 pub const INSTALL_WITH: Symbol = Symbol("install_with");
 
 pub const CONSTRUCTOR: Symbol = Symbol("constructor");
+pub const CONSTRUCTOR_FN: Symbol = Symbol("constructor_fn");
 pub const BUILTIN: Symbol = Symbol("builtin");
 pub const STATIC_TYPE: Symbol = Symbol("static_type");
 pub const FROM_VALUE: Symbol = Symbol("from_value");

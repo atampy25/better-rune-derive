@@ -227,24 +227,25 @@ fn expand_struct_install_with(
 
     match &st.fields {
         syn::Fields::Named(fields) => {
-            let constructor = attr
-                .constructor
-                .then(|| {
-                    let args = fields.named.iter().map(|f| {
-                        let ident = f.ident.as_ref().expect("named fields must have an Ident");
-                        let typ = &f.ty;
-                        quote!(#ident: #typ)
-                    });
+            let constructor = if attr.constructor {
+                let args = fields.named.iter().map(|f| {
+                    let ident = f.ident.as_ref().expect("named fields must have an Ident");
+                    let typ = &f.ty;
+                    quote!(#ident: #typ)
+                });
 
-                    let field_names = fields.named.iter().map(|f| f.ident.as_ref());
+                let field_names = fields.named.iter().map(|f| f.ident.as_ref());
 
-                    quote!(|#(#args),*| {
-                        #ident {
-                            #(#field_names),*
-                        }
-                    })
-                })
-                .map(|c| quote!(.constructor(#c)?));
+                Some(quote!(.constructor(|#(#args),*| {
+                    #ident {
+                        #(#field_names),*
+                    }
+                })?))
+            } else if let Some(x) = attr.constructor_fn.as_ref() {
+                Some(quote!(.constructor(#x)?))
+            } else {
+                None
+            };
 
             let fields = fields.named.iter().flat_map(|f| {
                 let ident = f.ident.as_ref()?;

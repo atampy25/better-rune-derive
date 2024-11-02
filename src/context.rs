@@ -75,6 +75,7 @@ pub(crate) struct TypeAttr {
     pub(crate) item: Option<syn::Path>,
     /// `#[rune(constructor)]`.
     pub(crate) constructor: bool,
+    pub(crate) constructor_fn: Option<syn::Path>,
     /// Protocols to "derive"
     pub(crate) protocols: Vec<TypeProtocol>,
     /// Associated functions
@@ -525,6 +526,9 @@ impl Context {
                             attr.install_with = Some(parse_path_compat(meta.input)?);
                         } else if meta.path == CONSTRUCTOR {
                             attr.constructor = true;
+                        } else if meta.path == CONSTRUCTOR_FN {
+                            meta.input.parse::<Token![=]>()?;
+                            attr.constructor_fn = Some(meta.input.parse()?);
                         } else {
                             return Err(syn::Error::new_spanned(
                                 &meta.path,
