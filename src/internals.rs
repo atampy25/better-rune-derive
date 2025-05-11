@@ -31,6 +31,7 @@ pub const FROM_VALUE_PARAMS: Symbol = Symbol("from_value_params");
 pub const GET: Symbol = Symbol("get");
 pub const SET: Symbol = Symbol("set");
 pub const COPY: Symbol = Symbol("copy");
+pub const BOXED: Symbol = Symbol("boxed");
 
 pub const ADD_ASSIGN: Symbol = Symbol("add_assign");
 pub const SUB_ASSIGN: Symbol = Symbol("sub_assign");

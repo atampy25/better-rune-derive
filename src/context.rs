@@ -1,18 +1,65 @@
 use std::cell::RefCell;
 
-use crate::internals::*;
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::quote_spanned;
 use quote::{quote, ToTokens};
-use syn::parse::Parse;
 use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned as _;
 use syn::Token;
 
+use rune_core::protocol::Protocol;
+
+use super::RUNE;
+
+#[derive(Default, Clone)]
+pub(super) enum CloneWith {
+    /// Use `rune::alloc::clone::TryClone`.
+    #[default]
+    TryClone,
+    /// Use `::alloc::clone::Clone`.
+    Clone,
+    /// The field is `Copy`.
+    Copy,
+    /// The field can be cloned with the given function.
+    With(syn::Path),
+    /// The field can be fallibly cloned with the given function.
+    TryWith(syn::Path),
+}
+
+impl CloneWith {
+    pub(super) fn decorate(&self, tokens: &Tokens, access: TokenStream) -> TokenStream {
+        let Tokens {
+            try_clone,
+            clone,
+            vm_try,
+            ..
+        } = tokens;
+
+        match self {
+            Self::TryClone => {
+                quote!(#vm_try!(#try_clone::try_clone(#access)))
+            }
+            Self::Clone => {
+                quote!(#clone::clone(#access))
+            }
+            Self::Copy => {
+                quote!(*#access)
+            }
+            Self::With(path) => {
+                quote!(#path(#access))
+            }
+            Self::TryWith(path) => {
+                quote!(#vm_try!(#path(#access)))
+            }
+        }
+    }
+}
+
 /// Parsed `#[rune(..)]` field attributes.
 #[derive(Default)]
+#[must_use = "Attributes must be used or explicitly ignored"]
 pub(crate) struct FieldAttrs {
     /// A field that is an identifier. Should use `Default::default` to be
     /// constructed and ignored during `ToTokens` and `Spanned`.
@@ -27,13 +74,12 @@ pub(crate) struct FieldAttrs {
     pub(crate) meta: Option<Span>,
     /// A single field marked with `#[rune(span)]`.
     pub(crate) span: Option<Span>,
-    /// Custom parser `#[rune(parse_with = "..")]`.
-    pub(crate) parse_with: Option<syn::Ident>,
+    /// Custom parser `#[rune(parse_with)]`.
+    pub(crate) parse_with: Option<syn::Path>,
     /// `#[rune(..)]` to generate a protocol function.
     pub(crate) protocols: Vec<FieldProtocol>,
-    /// `#[rune(copy)]` to indicate that a field is copy and does not need to be
-    /// cloned.
-    pub(crate) copy: bool,
+    /// The method to use when cloning the field.
+    pub(crate) clone_with: CloneWith,
     /// Whether this field should be known at compile time or not.
     pub(crate) field: bool,
 }
@@ -43,6 +89,14 @@ impl FieldAttrs {
     pub(crate) fn skip(&self) -> bool {
         self.skip.is_some() || self.id.is_some()
     }
+}
+
+/// Parsed #[const_value(..)] field attributes.
+#[derive(Default)]
+#[must_use = "Attributes must be used or explicitly ignored"]
+pub(crate) struct ConstValueFieldAttrs {
+    /// Define a custom parsing method.
+    pub(crate) with: Option<syn::Path>,
 }
 
 /// The parsing implementations to build.
@@ -62,6 +116,7 @@ impl Default for ParseKind {
 
 /// Parsed field attributes.
 #[derive(Default)]
+#[must_use = "Attributes must be used or explicitly ignored"]
 pub(crate) struct TypeAttr {
     /// `#[rune(name = TypeName)]` to override the default type name.
     pub(crate) name: Option<syn::Ident>,
@@ -74,30 +129,29 @@ pub(crate) struct TypeAttr {
     /// `#[rune(item = <path>)]`.
     pub(crate) item: Option<syn::Path>,
     /// `#[rune(constructor)]`.
-    pub(crate) constructor: bool,
+    pub(crate) constructor: Option<Span>,
     pub(crate) constructor_fn: Option<syn::Path>,
-    /// Protocols to "derive"
-    pub(crate) protocols: Vec<TypeProtocol>,
-    /// Associated functions
-    pub(crate) functions: Vec<syn::Path>,
     /// Parsed documentation.
     pub(crate) docs: Vec<syn::Expr>,
-    /// Indicates that this is a builtin type, so don't generate an `Any`
-    /// implementation for it.
-    pub(crate) builtin: Option<Span>,
-    /// Indicate a static type to use.
-    pub(crate) static_type: Option<syn::Ident>,
     /// Method to use to convert from value.
-    pub(crate) from_value: Option<syn::Path>,
-    /// Method to use to convert from value.
-    pub(crate) from_value_params: Option<syn::punctuated::Punctuated<syn::Type, Token![,]>>,
+    pub(crate) impl_params: Option<syn::punctuated::Punctuated<syn::TypeParam, Token![,]>>,
+}
+
+/// Parsed #[const_value(..)] field attributes.
+#[derive(Default)]
+#[must_use = "Attributes must be used or explicitly ignored"]
+pub(crate) struct ConstValueTypeAttr {
+    /// `#[const_value(module = <path>)]`.
+    pub(crate) module: Option<syn::Path>,
 }
 
 /// Parsed variant attributes.
 #[derive(Default)]
+#[must_use = "Attributes must be used or explicitly ignored"]
 pub(crate) struct VariantAttrs {
     /// `#[rune(constructor)]`.
-    pub(crate) constructor: bool,
+    pub(crate) constructor: Option<Span>,
+    pub(crate) constructor_fn: Option<syn::Path>,
     /// Discovered documentation.
     pub(crate) docs: Vec<syn::Expr>,
 }
@@ -126,66 +180,6 @@ pub(crate) struct Generate<'a> {
 pub(crate) struct FieldProtocol {
     pub(crate) generate: fn(Generate<'_>) -> TokenStream,
     custom: Option<syn::Path>,
-}
-
-pub(crate) struct TypeProtocol {
-    protocol: syn::Ident,
-    handler: Option<syn::Expr>,
-}
-
-impl TypeProtocol {
-    pub fn expand(&self) -> TokenStream {
-        if let Some(handler) = &self.handler {
-            let protocol = &self.protocol;
-            return quote_spanned! {protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::#protocol, #handler)?;
-            };
-        }
-        match self.protocol.to_string().as_str() {
-            "ADD" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::ADD, |this: Self, other: Self| this + other)?;
-            },
-            "STRING_DISPLAY" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::STRING_DISPLAY, |this: &Self, f: &mut rune::runtime::Formatter| {
-                    use rune::alloc::fmt::TryWrite;
-                    rune::vm_write!(f, "{}", this);
-                    rune::runtime::VmResult::Ok(())
-                })?;
-            },
-            "STRING_DEBUG" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::STRING_DEBUG, |this: &Self, f: &mut rune::runtime::Formatter| {
-                    use rune::alloc::fmt::TryWrite;
-                    rune::vm_write!(f, "{:?}", this);
-                    rune::runtime::VmResult::Ok(())
-                })?;
-            },
-            _ => unreachable!("`parse()` ensures only supported protocols"),
-        }
-    }
-}
-
-impl Parse for TypeProtocol {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let it = Self {
-            protocol: input.parse()?,
-            handler: if input.parse::<Token![=]>().is_ok() {
-                Some(input.parse()?)
-            } else {
-                None
-            },
-        };
-
-        if it.handler.is_some()
-            || ["ADD", "STRING_DISPLAY", "STRING_DEBUG"].contains(&it.protocol.to_string().as_str())
-        {
-            Ok(it)
-        } else {
-            Err(syn::Error::new_spanned(
-                &it.protocol,
-                format!("Rune protocol `{}` cannot be derived", it.protocol),
-            ))
-        }
-    }
 }
 
 #[derive(Default)]
@@ -217,6 +211,47 @@ impl Context {
         }
     }
 
+    /// Helper to build using a function that takes a context.
+    pub(super) fn build(f: impl FnOnce(&Self) -> Result<TokenStream, ()>) -> TokenStream {
+        let cx = Self::new();
+        cx.build_inner(f)
+    }
+
+    /// Helper to build using a function that takes a context internally.
+    pub(super) fn build_with_crate(
+        f: impl FnOnce(&Self) -> Result<TokenStream, ()>,
+    ) -> TokenStream {
+        let cx = Self::with_crate();
+        cx.build_inner(f)
+    }
+
+    fn build_inner(self, f: impl FnOnce(&Self) -> Result<TokenStream, ()>) -> TokenStream {
+        fn to_compile_errors<I>(errors: I) -> TokenStream
+        where
+            I: IntoIterator<Item = syn::Error>,
+        {
+            let mut stream = TokenStream::default();
+
+            for error in errors {
+                stream.extend(error.into_compile_error());
+            }
+
+            stream
+        }
+
+        let Ok(builder) = f(&self) else {
+            return to_compile_errors(self.errors.into_inner());
+        };
+
+        let errors = self.errors.into_inner();
+
+        if !errors.is_empty() {
+            return to_compile_errors(errors);
+        }
+
+        builder
+    }
+
     /// Register an error.
     pub(crate) fn error(&self, error: syn::Error) {
         self.errors.borrow_mut().push(error)
@@ -240,8 +275,37 @@ impl Context {
         Ok(ident)
     }
 
+    pub(crate) fn const_value_field_attrs(&self, input: &[syn::Attribute]) -> ConstValueFieldAttrs {
+        let mut attr = ConstValueFieldAttrs::default();
+
+        for a in input {
+            if !a.path().is_ident("const_value") {
+                continue;
+            }
+
+            let result = a.parse_nested_meta(|meta| {
+                if meta.path.is_ident("with") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.with = Some(meta.input.parse::<syn::Path>()?);
+                    return Ok(());
+                }
+
+                Err(syn::Error::new_spanned(
+                    &meta.path,
+                    "Unsupported field attribute",
+                ))
+            });
+
+            if let Err(e) = result {
+                self.error(e);
+            };
+        }
+
+        attr
+    }
+
     /// Parse field attributes.
-    pub(crate) fn field_attrs(&self, input: &[syn::Attribute]) -> Result<FieldAttrs, ()> {
+    pub(crate) fn field_attrs(&self, input: &[syn::Attribute]) -> FieldAttrs {
         macro_rules! generate_assign {
             ($proto:ident, $op:tt) => {
                 |g| {
@@ -253,17 +317,17 @@ impl Context {
                         ..
                     } = g;
 
-                    let protocol_field = g.tokens.protocol($proto);
+                    let protocol_field = g.tokens.protocol(&Protocol::$proto);
 
                     match target {
                         GenerateTarget::Named { field_ident, field_name } => {
                             if let Some(custom) = &protocol.custom {
                                 quote_spanned! { field.span() =>
-                                    module.field_function(#protocol_field, #field_name, #custom)?;
+                                    module.field_function(&#protocol_field, #field_name, #custom)?;
                                 }
                             } else {
                                 quote_spanned! { field.span() =>
-                                    module.field_function(#protocol_field, #field_name, |s: &mut Self, value: #ty| {
+                                    module.field_function(&#protocol_field, #field_name, |s: &mut Self, value: #ty| {
                                         s.#field_ident $op value;
                                     })?;
                                 }
@@ -272,11 +336,11 @@ impl Context {
                         GenerateTarget::Numbered { field_index } => {
                             if let Some(custom) = &protocol.custom {
                                 quote_spanned! { field.span() =>
-                                    module.index_function(#protocol_field, #field_index, #custom)?;
+                                    module.index_function(&#protocol_field, #field_index, #custom)?;
                                 }
                             } else {
                                 quote_spanned! { field.span() =>
-                                    module.index_function(#protocol_field, #field_index, |s: &mut Self, value: #ty| {
+                                    module.index_function(&#protocol_field, #field_index, |s: &mut Self, value: #ty| {
                                         s.#field_index $op value;
                                     })?;
                                 }
@@ -287,42 +351,145 @@ impl Context {
             };
         }
 
-        let mut error = false;
+        macro_rules! generate {
+            ($proto:ident, $op:tt) => {
+                |g| {
+                    let Generate {
+                        ty,
+                        target,
+                        field,
+                        protocol,
+                        ..
+                    } = g;
+
+                    let protocol_field = g.tokens.protocol(&Protocol::$proto);
+
+                    match target {
+                        GenerateTarget::Named { field_ident, field_name } => {
+                            if let Some(custom) = &protocol.custom {
+                                quote_spanned! { field.span() =>
+                                    module.field_function(&#protocol_field, #field_name, #custom)?;
+                                }
+                            } else {
+                                quote_spanned! { field.span() =>
+                                    module.field_function(&#protocol_field, #field_name, |s: &mut Self, value: #ty| {
+                                        s.#field_ident $op value
+                                    })?;
+                                }
+                            }
+                        }
+                        GenerateTarget::Numbered { field_index } => {
+                            if let Some(custom) = &protocol.custom {
+                                quote_spanned! { field.span() =>
+                                    module.index_function(&#protocol_field, #field_index, #custom)?;
+                                }
+                            } else {
+                                quote_spanned! { field.span() =>
+                                    module.index_function(&#protocol_field, #field_index, |s: &mut Self, value: #ty| {
+                                        s.#field_index $op value
+                                    })?;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
         let mut attr = FieldAttrs::default();
 
         for a in input {
-            if a.path() != RUNE {
+            if !a.path().is_ident(RUNE) {
                 continue;
             }
 
             let result = a.parse_nested_meta(|meta| {
-                if meta.path == ID {
-                    // Parse `#[rune(id)]`
+                macro_rules! field_functions {
+                    (
+                        $(
+                            $assign:literal, $assign_proto:ident, [$($assign_op:tt)*],
+                            $op:literal, $op_proto:ident, [$($op_op:tt)*],
+                        )*
+                    ) => {{
+                        $(
+                            if meta.path.is_ident($assign) {
+                                attr.protocols.push(FieldProtocol {
+                                    custom: self.parse_field_custom(meta.input)?,
+                                    generate: generate_assign!($assign_proto, $($assign_op)*),
+                                });
+
+                                return Ok(());
+                            }
+
+                            if meta.path.is_ident($op) {
+                                attr.protocols.push(FieldProtocol {
+                                    custom: self.parse_field_custom(meta.input)?,
+                                    generate: generate!($op_proto, $($op_op)*),
+                                });
+
+                                return Ok(());
+                            }
+                        )*
+                    }};
+                }
+
+                if meta.path.is_ident("id") {
                     attr.id = Some(meta.path.span());
-                } else if meta.path == ITER {
-                    // `#[rune(iter)]`.
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("iter") {
                     attr.iter = Some(meta.path.span());
-                } else if meta.path == SKIP {
-                    // `#[rune(skip)]`.
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("skip") {
                     attr.skip = Some(meta.path.span());
-                } else if meta.path == OPTION {
-                    // `#[rune(option)]`.
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("option") {
                     attr.option = Some(meta.path.span());
-                } else if meta.path == META {
-                    // `#[rune(meta)]`.
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("meta") {
                     attr.meta = Some(meta.path.span());
-                } else if meta.path == SPAN {
-                    // `#[rune(span)]`.
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("span") {
                     attr.span = Some(meta.path.span());
-                } else if meta.path == COPY {
-                    // `#[rune(copy)]`.
-                    attr.copy = true;
-                } else if meta.path == PARSE_WITH {
-                    // Parse `#[rune(parse_with = "..")]`.
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("copy") {
+                    attr.clone_with = CloneWith::Copy;
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("clone") {
+                    attr.clone_with = CloneWith::Clone;
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("clone_with") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.clone_with = CloneWith::With(meta.input.parse()?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("try_clone_with") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.clone_with = CloneWith::TryWith(meta.input.parse()?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("parse_with") {
                     if let Some(old) = &attr.parse_with {
                         let mut error = syn::Error::new_spanned(
                             &meta.path,
-                            "#[rune(parse_with = \"..\")] can only be used once",
+                            "#[rune(parse_with)] can only be used once",
                         );
 
                         error.combine(syn::Error::new_spanned(old, "previously defined here"));
@@ -330,9 +497,11 @@ impl Context {
                     }
 
                     meta.input.parse::<Token![=]>()?;
-                    let s = meta.input.parse::<syn::LitStr>()?;
-                    attr.parse_with = Some(syn::Ident::new(&s.value(), s.span()));
-                } else if meta.path == GET {
+                    attr.parse_with = Some(meta.input.parse()?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("get") {
                     attr.field = true;
                     attr.protocols.push(FieldProtocol {
                         custom: self.parse_field_custom(meta.input)?,
@@ -342,37 +511,36 @@ impl Context {
                                 ..
                             } = g;
 
+                            let Tokens {
+                                vm_result,
+                                ..
+                            } = g.tokens;
+
                             match target {
                                 GenerateTarget::Named { field_ident, field_name } => {
-                                    let access = if g.attrs.copy {
-                                        quote!(s.#field_ident)
-                                    } else {
-                                        quote!(Clone::clone(&s.#field_ident))
-                                    };
-
-                                    let protocol = g.tokens.protocol(PROTOCOL_GET);
+                                    let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_ident));
+                                    let protocol = g.tokens.protocol(&Protocol::GET);
 
                                     quote_spanned! { g.field.span() =>
-                                        module.field_function(#protocol, #field_name, |s: &Self| #access)?;
+                                        module.field_function(&#protocol, #field_name, |s: &Self| #vm_result::Ok(#access))?;
                                     }
                                 }
                                 GenerateTarget::Numbered { field_index } => {
-                                    let access = if g.attrs.copy {
-                                        quote!(s.#field_index)
-                                    } else {
-                                        quote!(Clone::clone(&s.#field_index))
-                                    };
-
-                                    let protocol = g.tokens.protocol(PROTOCOL_GET);
+                                    let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_index));
+                                    let protocol = g.tokens.protocol(&Protocol::GET);
 
                                     quote_spanned! { g.field.span() =>
-                                        module.index_function(#protocol, #field_index, |s: &Self| #access)?;
+                                        module.index_function(&#protocol, #field_index, |s: &Self| #vm_result::Ok(#access))?;
                                     }
                                 }
                             }
                         },
                     });
-                } else if meta.path == SET {
+
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("set") {
                     attr.protocols.push(FieldProtocol {
                         custom: self.parse_field_custom(meta.input)?,
                         generate: |g| {
@@ -382,19 +550,19 @@ impl Context {
                                 ..
                             } = g;
 
-                            let protocol = g.tokens.protocol(PROTOCOL_SET);
+                            let protocol = g.tokens.protocol(&Protocol::SET);
 
                             match target {
                                 GenerateTarget::Named { field_ident, field_name } => {
                                     quote_spanned! { g.field.span() =>
-                                        module.field_function(#protocol, #field_name, |s: &mut Self, value: #ty| {
+                                        module.field_function(&#protocol, #field_name, |s: &mut Self, value: #ty| {
                                             s.#field_ident = value;
                                         })?;
                                     }
                                 }
                                 GenerateTarget::Numbered { field_index } => {
                                     quote_spanned! { g.field.span() =>
-                                        module.index_function(#protocol, #field_index, |s: &mut Self, value: #ty| {
+                                        module.index_function(&#protocol, #field_index, |s: &mut Self, value: #ty| {
                                             s.#field_index = value;
                                         })?;
                                     }
@@ -402,185 +570,70 @@ impl Context {
                             }
                         },
                     });
-                } else if meta.path == ADD_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_ADD_ASSIGN, +=),
-                    });
-                } else if meta.path == SUB_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_SUB_ASSIGN, -=),
-                    });
-                } else if meta.path == DIV_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_DIV_ASSIGN, /=),
-                    });
-                } else if meta.path == MUL_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_MUL_ASSIGN, *=),
-                    });
-                } else if meta.path == BIT_AND_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_BIT_AND_ASSIGN, &=),
-                    });
-                } else if meta.path == BIT_OR_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_BIT_OR_ASSIGN, |=),
-                    });
-                } else if meta.path == BIT_XOR_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_BIT_XOR_ASSIGN, ^=),
-                    });
-                } else if meta.path == SHL_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_SHL_ASSIGN, <<=),
-                    });
-                } else if meta.path == SHR_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_SHR_ASSIGN, >>=),
-                    });
-                } else if meta.path == REM_ASSIGN {
-                    attr.protocols.push(FieldProtocol {
-                        custom: self.parse_field_custom(meta.input)?,
-                        generate: generate_assign!(PROTOCOL_REM_ASSIGN, %=),
-                    });
-                } else {
-                    return Err(syn::Error::new_spanned(&meta.path, "Unsupported attribute"));
+
+                    return Ok(());
                 }
 
-                Ok(())
+                field_functions! {
+                    "add_assign", ADD_ASSIGN, [+=], "add", ADD, [+],
+                    "sub_assign", SUB_ASSIGN, [-=], "sub", SUB, [-],
+                    "div_assign", DIV_ASSIGN, [/=], "div", DIV, [/],
+                    "mul_assign", MUL_ASSIGN, [*=], "mul", MUL, [*],
+                    "rem_assign", REM_ASSIGN, [%=], "rem", REM, [%],
+                    "bit_and_assign", BIT_AND_ASSIGN, [&=], "bit_and", BIT_AND, [&],
+                    "bit_or_assign", BIT_OR_ASSIGN, [|=], "bit_or", BIT_OR, [|],
+                    "bit_xor_assign", BIT_XOR_ASSIGN, [^=], "bit_xor", BIT_XOR, [^],
+                    "shl_assign", SHL_ASSIGN, [<<=], "shl", SHL, [<<],
+                    "shr_assign", SHR_ASSIGN, [>>=], "shr", SHR, [>>],
+                }
+
+                Err(syn::Error::new_spanned(&meta.path, "Unsupported attribute"))
             });
 
             if let Err(e) = result {
-                error = true;
                 self.error(e);
             }
         }
 
-        if error {
-            return Err(());
-        }
-
-        Ok(attr)
+        attr
     }
 
-    /// Parse field attributes.
-    pub(crate) fn type_attrs(&self, input: &[syn::Attribute]) -> Result<TypeAttr, ()> {
-        let mut error = false;
-        let mut attr = TypeAttr::default();
+    pub(crate) fn const_value_type_attrs(&self, input: &[syn::Attribute]) -> ConstValueTypeAttr {
+        let mut attr = ConstValueTypeAttr::default();
 
-        'attrs: for a in input {
-            if a.path().is_ident("doc") {
-                if let syn::Meta::NameValue(meta) = &a.meta {
-                    attr.docs.push(meta.value.clone());
-                }
-
+        for a in input {
+            if !a.path().is_ident("const_value") {
                 continue;
             }
 
-            let err = 'error: {
-                if a.path() == RUNE {
-                    let result = a.parse_nested_meta(|meta| {
-                        if meta.path == PARSE {
-                            // Parse `#[rune(parse = "..")]`
-                            meta.input.parse::<Token![=]>()?;
-                            let s: syn::LitStr = meta.input.parse()?;
+            let result = a.parse_nested_meta(|meta| {
+                if meta.path.is_ident("module") || meta.path.is_ident("crate") {
+                    if meta.input.parse::<Option<Token![=]>>()?.is_some() {
+                        attr.module = Some(parse_path_compat(meta.input)?);
+                    } else {
+                        attr.module = Some(syn::parse_quote!(crate));
+                    }
 
-                            match s.value().as_str() {
-                                "meta_only" => {
-                                    attr.parse = ParseKind::MetaOnly;
-                                }
-                                other => {
-                                    return Err(syn::Error::new(
-                                        meta.input.span(),
-                                        format!(
-                                            "Unsupported `#[rune(parse = ..)]` argument `{}`",
-                                            other
-                                        ),
-                                    ));
-                                }
-                            };
-                        } else if meta.path == ITEM {
-                            // Parse `#[rune(item = "..")]`
-                            meta.input.parse::<Token![=]>()?;
-                            attr.item = Some(meta.input.parse()?);
-                        } else if meta.path == NAME {
-                            // Parse `#[rune(name = "..")]`
-                            meta.input.parse::<Token![=]>()?;
-                            attr.name = Some(meta.input.parse()?);
-                        } else if meta.path == MODULE {
-                            // Parse `#[rune(module = <path>)]`
-                            meta.input.parse::<Token![=]>()?;
-                            attr.module = Some(parse_path_compat(meta.input)?);
-                        } else if meta.path == INSTALL_WITH {
-                            // Parse `#[rune(install_with = <path>)]`
-                            meta.input.parse::<Token![=]>()?;
-                            attr.install_with = Some(parse_path_compat(meta.input)?);
-                        } else if meta.path == CONSTRUCTOR {
-                            attr.constructor = true;
-                        } else if meta.path == CONSTRUCTOR_FN {
-                            meta.input.parse::<Token![=]>()?;
-                            attr.constructor_fn = Some(meta.input.parse()?);
-                        } else {
-                            return Err(syn::Error::new_spanned(
-                                &meta.path,
-                                "Unsupported type attribute",
-                            ));
-                        }
-                        Ok(())
-                    });
-
-                    if let Err(e) = result {
-                        break 'error e;
-                    };
+                    return Ok(());
                 }
 
-                if a.path() == RUNE_DERIVE {
-                    attr.protocols.extend(
-                        match a.parse_args_with(Punctuated::<_, Token![,]>::parse_terminated) {
-                            Ok(it) => it,
-                            Err(err) => {
-                                break 'error err;
-                            }
-                        },
-                    );
-                }
+                Err(syn::Error::new_spanned(
+                    &meta.path,
+                    "Unsupported type attribute",
+                ))
+            });
 
-                if a.path() == RUNE_FUNCTIONS {
-                    attr.functions.extend(
-                        match a.parse_args_with(Punctuated::<_, Token![,]>::parse_terminated) {
-                            Ok(it) => it,
-                            Err(err) => {
-                                break 'error err;
-                            }
-                        },
-                    );
-                }
-                continue 'attrs;
+            if let Err(e) = result {
+                self.error(e);
             };
-            error = true;
-            self.error(err);
         }
 
-        if error {
-            return Err(());
-        }
-
-        Ok(attr)
+        attr
     }
 
-    /// Parse and extract variant attributes.
-    pub(crate) fn variant_attr(&self, input: &[syn::Attribute]) -> Result<VariantAttrs, ()> {
-        let mut attr = VariantAttrs::default();
-        let mut error = false;
+    /// Parse field attributes.
+    pub(crate) fn type_attrs(&self, input: &[syn::Attribute]) -> TypeAttr {
+        let mut attr = TypeAttr::default();
 
         for a in input {
             if a.path().is_ident("doc") {
@@ -591,36 +644,184 @@ impl Context {
                 continue;
             }
 
-            if a.path() == RUNE {
-                let result = a.parse_nested_meta(|meta| {
-                    if meta.path == CONSTRUCTOR {
-                        if attr.constructor {
-                            return Err(syn::Error::new_spanned(
-                                &meta.path,
-                                "#[rune(constructor)] must only be used once",
+            if !a.path().is_ident(RUNE) {
+                continue;
+            }
+
+            let result = a.parse_nested_meta(|meta| {
+                if meta.path.is_ident("parse") {
+                    meta.input.parse::<Token![=]>()?;
+                    let s: syn::LitStr = meta.input.parse()?;
+
+                    match s.value().as_str() {
+                        "meta_only" => {
+                            attr.parse = ParseKind::MetaOnly;
+                        }
+                        other => {
+                            return Err(syn::Error::new(
+                                meta.input.span(),
+                                format!("Unsupported `#[rune(parse = ..)]` argument `{}`", other),
                             ));
                         }
+                    };
 
-                        attr.constructor = true;
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("item") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.item = Some(meta.input.parse()?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("name") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.name = Some(meta.input.parse()?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("module") || meta.path.is_ident("crate") {
+                    if meta.input.parse::<Option<Token![=]>>()?.is_some() {
+                        attr.module = Some(parse_path_compat(meta.input)?);
                     } else {
-                        return Err(syn::Error::new_spanned(&meta.path, "Unsupported attribute"));
+                        attr.module = Some(syn::parse_quote!(crate));
                     }
 
-                    Ok(())
-                });
+                    return Ok(());
+                }
 
-                if let Err(e) = result {
-                    error = true;
-                    self.error(e);
-                };
+                if meta.path.is_ident("install_with") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.install_with = Some(parse_path_compat(meta.input)?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("constructor") {
+                    if attr.constructor.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor)] must only be used once",
+                        ));
+                    }
+
+                    if attr.constructor_fn.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor)] or #[rune(constructor_fn)] must only be used once",
+                        ));
+                    }
+
+                    attr.constructor = Some(meta.path.span());
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("constructor_fn") {
+                    if attr.constructor.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor)] or #[rune(constructor_fn)] must only be used once",
+                        ));
+                    }
+
+                    if attr.constructor_fn.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor_fn)] must only be used once",
+                        ));
+                    }
+
+                    meta.input.parse::<Token![=]>()?;
+                    attr.constructor_fn = Some(meta.input.parse()?);
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("impl_params") {
+                    meta.input.parse::<Token![=]>()?;
+                    let content;
+                    syn::bracketed!(content in meta.input);
+                    attr.impl_params =
+                        Some(syn::punctuated::Punctuated::parse_terminated(&content)?);
+                    return Ok(());
+                }
+
+                Err(syn::Error::new_spanned(
+                    &meta.path,
+                    "Unsupported type attribute",
+                ))
+            });
+
+            if let Err(e) = result {
+                self.error(e);
+            };
+        }
+
+        attr
+    }
+
+    /// Parse and extract variant attributes.
+    pub(crate) fn variant_attr(&self, input: &[syn::Attribute]) -> VariantAttrs {
+        let mut attr = VariantAttrs::default();
+
+        for a in input {
+            if a.path().is_ident("doc") {
+                if let syn::Meta::NameValue(meta) = &a.meta {
+                    attr.docs.push(meta.value.clone());
+                }
+
+                continue;
+            }
+
+            if !a.path().is_ident(RUNE) {
+                continue;
+            }
+
+            let result = a.parse_nested_meta(|meta| {
+                if meta.path.is_ident("constructor") {
+                    if attr.constructor.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor)] must only be used once",
+                        ));
+                    }
+
+                    if attr.constructor_fn.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor)] or #[rune(constructor_fn)] must only be used once",
+                        ));
+                    }
+
+                    attr.constructor = Some(meta.path.span());
+                } else if meta.path.is_ident("constructor_fn") {
+                    if attr.constructor.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor)] or #[rune(constructor_fn)] must only be used once",
+                        ));
+                    }
+                    
+                    if attr.constructor_fn.is_some() {
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "#[rune(constructor_fn)] must only be used once",
+                        ));
+                    }
+
+                    meta.input.parse::<Token![=]>()?;
+                    attr.constructor_fn = Some(meta.input.parse()?);
+                } else {
+                    return Err(syn::Error::new_spanned(&meta.path, "Unsupported attribute"));
+                }
+
+                Ok(())
+            });
+
+            if let Err(e) = result {
+                self.error(e);
             }
         }
 
-        if error {
-            return Err(());
-        }
-
-        Ok(attr)
+        attr
     }
 
     /// Parse path to custom field function.
@@ -665,71 +866,77 @@ impl Context {
                     };
                     default_module
                         .segments
-                        .push(syn::PathSegment::from(RUNE.to_ident(Span::call_site())));
+                        .push(syn::PathSegment::from(syn::Ident::new(
+                            RUNE,
+                            Span::call_site(),
+                        )));
                     &default_module
                 }
             },
         };
 
+        let core = &core;
+
         Tokens {
-            any_type_info: path(m, ["runtime", "AnyTypeInfo"]),
-            any: path(m, ["Any"]),
-            box_: path(m, ["__private", "Box"]),
-            vec: path(m, ["alloc", "Vec"]),
-            clone: path(&core, ["clone", "Clone"]),
+            alloc: path(m, ["alloc"]),
+            any_marker_t: path(m, ["__priv", "AnyMarker"]),
+            any_t: path(m, ["Any"]),
+            any_type_info: path(m, ["__priv", "AnyTypeInfo"]),
+            arc: path(m, ["__priv", "Arc"]),
+            clone: path(m, ["__priv", "Clone"]),
             compile_error: path(m, ["compile", "Error"]),
+            const_construct_t: path(m, ["__priv", "ConstConstruct"]),
+            const_value: path(m, ["__priv", "ConstValue"]),
             context_error: path(m, ["compile", "ContextError"]),
-            double_ended_iterator: path(&core, ["iter", "DoubleEndedIterator"]),
-            from_value: path(m, ["runtime", "FromValue"]),
-            full_type_of: path(m, ["runtime", "FullTypeOf"]),
+            double_ended_iterator: path(core, ["iter", "DoubleEndedIterator"]),
+            fmt: path(core, ["fmt"]),
+            from_const_value_t: path(m, ["__priv", "FromConstValue"]),
+            from_value: path(m, ["__priv", "FromValue"]),
             hash: path(m, ["Hash"]),
             id: path(m, ["parse", "Id"]),
-            install_with: path(m, ["__private", "InstallWith"]),
-            into_iterator: path(&core, ["iter", "IntoIterator"]),
-            iterator: path(&core, ["iter", "Iterator"]),
+            install_with: path(m, ["__priv", "InstallWith"]),
+            into_iterator: path(core, ["iter", "IntoIterator"]),
+            item: path(m, ["__priv", "Item"]),
+            iterator: path(core, ["iter", "Iterator"]),
             macro_context: path(m, ["macros", "MacroContext"]),
-            maybe_type_of: path(m, ["runtime", "MaybeTypeOf"]),
-            module: path(m, ["__private", "Module"]),
-            mut_: path(m, ["runtime", "Mut"]),
+            maybe_type_of: path(m, ["__priv", "MaybeTypeOf"]),
+            meta: path(m, ["compile", "meta"]),
+            module: path(m, ["__priv", "Module"]),
             named: path(m, ["compile", "Named"]),
-            non_null: path(&core, ["ptr", "NonNull"]),
-            object: path(m, ["runtime", "Object"]),
+            non_null: path(core, ["ptr", "NonNull"]),
+            object: path(m, ["__priv", "Object"]),
             opaque: path(m, ["parse", "Opaque"]),
             option_spanned: path(m, ["ast", "OptionSpanned"]),
-            option: path(&core, ["option", "Option"]),
-            owned_tuple: path(m, ["runtime", "OwnedTuple"]),
+            option: path(core, ["option", "Option"]),
+            owned_tuple: path(m, ["__priv", "OwnedTuple"]),
             parse: path(m, ["parse", "Parse"]),
             parser: path(m, ["parse", "Parser"]),
-            pointer_guard: path(m, ["runtime", "SharedPointerGuard"]),
-            protocol: path(m, ["runtime", "Protocol"]),
-            raw_into_mut: path(m, ["runtime", "RawMut"]),
-            raw_into_ref: path(m, ["runtime", "RawRef"]),
-            raw_mut: path(m, ["runtime", "RawMut"]),
-            raw_ref: path(m, ["runtime", "RawRef"]),
-            raw_str: path(m, ["runtime", "RawStr"]),
-            ref_: path(m, ["runtime", "Ref"]),
-            result: path(&core, ["result", "Result"]),
-            shared: path(m, ["runtime", "Shared"]),
+            protocol: path(m, ["__priv", "Protocol"]),
+            raw_value_guard: path(m, ["__priv", "RawValueGuard"]),
+            result: path(core, ["result", "Result"]),
+            runtime_error: path(m, ["__priv", "RuntimeError"]),
             span: path(m, ["ast", "Span"]),
             spanned: path(m, ["ast", "Spanned"]),
-            static_type_mod: path(m, ["runtime", "static_type"]),
-            string: path(m, ["alloc", "String"]),
+            to_const_value_t: path(m, ["__priv", "ToConstValue"]),
             to_tokens: path(m, ["macros", "ToTokens"]),
-            to_value: path(m, ["runtime", "ToValue"]),
+            to_value: path(m, ["__priv", "ToValue"]),
             token_stream: path(m, ["macros", "TokenStream"]),
-            try_from: path(&core, ["convert", "TryFrom"]),
-            tuple: path(m, ["runtime", "Tuple"]),
-            type_info: path(m, ["runtime", "TypeInfo"]),
-            type_name: path(&core, ["any", "type_name"]),
-            type_of: path(m, ["runtime", "TypeOf"]),
-            unsafe_to_mut: path(m, ["runtime", "UnsafeToMut"]),
-            unsafe_to_ref: path(m, ["runtime", "UnsafeToRef"]),
-            unsafe_to_value: path(m, ["runtime", "UnsafeToValue"]),
-            value: path(m, ["runtime", "Value"]),
-            variant_data: path(m, ["runtime", "VariantData"]),
-            vm_result: path(m, ["runtime", "VmResult"]),
+            try_clone: path(m, ["alloc", "clone", "TryClone"]),
+            try_from: path(core, ["convert", "TryFrom"]),
+            tuple: path(m, ["__priv", "Tuple"]),
+            type_hash_t: path(m, ["__priv", "TypeHash"]),
+            type_name: path(core, ["any", "type_name"]),
+            type_of: path(m, ["__priv", "TypeOf"]),
+            type_value: path(m, ["__priv", "TypeValue"]),
+            unsafe_to_mut: path(m, ["__priv", "UnsafeToMut"]),
+            unsafe_to_ref: path(m, ["__priv", "UnsafeToRef"]),
+            unsafe_to_value: path(m, ["__priv", "UnsafeToValue"]),
+            value_mut_guard: path(m, ["__priv", "ValueMutGuard"]),
+            value_ref_guard: path(m, ["__priv", "ValueRefGuard"]),
+            value: path(m, ["__priv", "Value"]),
+            vm_result: path(m, ["__priv", "VmResult"]),
             vm_try: path(m, ["vm_try"]),
-            alloc: path(m, ["alloc"]),
+            write: path(core, ["write"]),
         }
     }
 }
@@ -764,25 +971,30 @@ fn path<const N: usize>(base: &syn::Path, path: [&'static str; N]) -> syn::Path 
 }
 
 pub(crate) struct Tokens {
+    pub(crate) alloc: syn::Path,
+    pub(crate) any_marker_t: syn::Path,
+    pub(crate) any_t: syn::Path,
     pub(crate) any_type_info: syn::Path,
-    pub(crate) any: syn::Path,
-    pub(crate) box_: syn::Path,
-    pub(crate) vec: syn::Path,
+    pub(crate) arc: syn::Path,
     pub(crate) clone: syn::Path,
     pub(crate) compile_error: syn::Path,
+    pub(crate) const_construct_t: syn::Path,
+    pub(crate) const_value: syn::Path,
     pub(crate) context_error: syn::Path,
     pub(crate) double_ended_iterator: syn::Path,
+    pub(crate) fmt: syn::Path,
+    pub(crate) from_const_value_t: syn::Path,
     pub(crate) from_value: syn::Path,
-    pub(crate) full_type_of: syn::Path,
     pub(crate) hash: syn::Path,
     pub(crate) id: syn::Path,
     pub(crate) install_with: syn::Path,
     pub(crate) into_iterator: syn::Path,
+    pub(crate) item: syn::Path,
     pub(crate) iterator: syn::Path,
     pub(crate) macro_context: syn::Path,
     pub(crate) maybe_type_of: syn::Path,
+    pub(crate) meta: syn::Path,
     pub(crate) module: syn::Path,
-    pub(crate) mut_: syn::Path,
     pub(crate) named: syn::Path,
     pub(crate) non_null: syn::Path,
     pub(crate) object: syn::Path,
@@ -792,42 +1004,41 @@ pub(crate) struct Tokens {
     pub(crate) owned_tuple: syn::Path,
     pub(crate) parse: syn::Path,
     pub(crate) parser: syn::Path,
-    pub(crate) pointer_guard: syn::Path,
     pub(crate) protocol: syn::Path,
-    pub(crate) raw_into_mut: syn::Path,
-    pub(crate) raw_into_ref: syn::Path,
-    pub(crate) raw_mut: syn::Path,
-    pub(crate) raw_ref: syn::Path,
-    pub(crate) raw_str: syn::Path,
-    pub(crate) ref_: syn::Path,
+    pub(crate) raw_value_guard: syn::Path,
     pub(crate) result: syn::Path,
-    pub(crate) shared: syn::Path,
+    pub(crate) runtime_error: syn::Path,
     pub(crate) span: syn::Path,
     pub(crate) spanned: syn::Path,
-    pub(crate) static_type_mod: syn::Path,
-    pub(crate) string: syn::Path,
+    pub(crate) to_const_value_t: syn::Path,
     pub(crate) to_tokens: syn::Path,
     pub(crate) to_value: syn::Path,
     pub(crate) token_stream: syn::Path,
+    pub(crate) try_clone: syn::Path,
     pub(crate) try_from: syn::Path,
     pub(crate) tuple: syn::Path,
-    pub(crate) type_info: syn::Path,
+    pub(crate) type_hash_t: syn::Path,
     pub(crate) type_name: syn::Path,
     pub(crate) type_of: syn::Path,
+    pub(crate) type_value: syn::Path,
     pub(crate) unsafe_to_mut: syn::Path,
     pub(crate) unsafe_to_ref: syn::Path,
     pub(crate) unsafe_to_value: syn::Path,
+    pub(crate) value_mut_guard: syn::Path,
+    pub(crate) value_ref_guard: syn::Path,
     pub(crate) value: syn::Path,
-    pub(crate) variant_data: syn::Path,
     pub(crate) vm_result: syn::Path,
     pub(crate) vm_try: syn::Path,
-    pub(crate) alloc: syn::Path,
+    pub(crate) write: syn::Path,
 }
 
 impl Tokens {
     /// Define a tokenstream for the specified protocol
-    pub(crate) fn protocol(&self, sym: Symbol) -> TokenStream {
-        let protocol = &self.protocol;
-        quote!(#protocol::#sym)
+    pub(crate) fn protocol(&self, sym: &Protocol) -> TokenStream {
+        let mut stream = TokenStream::default();
+        self.protocol.to_tokens(&mut stream);
+        <Token![::]>::default().to_tokens(&mut stream);
+        syn::Ident::new(sym.name, Span::call_site()).to_tokens(&mut stream);
+        stream
     }
 }

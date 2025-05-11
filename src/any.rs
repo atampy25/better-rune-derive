@@ -2,75 +2,140 @@ use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned, ToTokens};
-use rune_core::Hash;
+use rune_core::hash::Hash;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::Token;
 
 use crate::context::{Context, Generate, GenerateTarget, Tokens, TypeAttr};
 
-/// An internal call to the macro.
-pub struct InternalCall {
+struct InternalItem {
+    attrs: Vec<syn::Attribute>,
+    #[allow(unused)]
+    impl_token: Token![impl],
+    params: Option<Params>,
     item: syn::Path,
-    path: syn::Path,
+    #[allow(unused)]
+    for_token: Token![for],
+    ty: syn::Type,
 }
 
-impl syn::parse::Parse for InternalCall {
+impl syn::parse::Parse for InternalItem {
+    #[inline]
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let item = input.parse()?;
-        input.parse::<Token![,]>()?;
-        let path = input.parse()?;
-        Ok(Self { item, path })
-    }
-}
-
-impl InternalCall {
-    pub(super) fn into_any_builder(self, cx: &Context) -> Result<TypeBuilder<syn::Path>, ()> {
-        let tokens = cx.tokens_with_module(None);
-
-        let name = match self.path.segments.last() {
-            Some(last) if last.arguments.is_empty() => last.ident.clone(),
-            _ => {
-                cx.error(syn::Error::new(
-                    self.path.span(),
-                    "expected last component in path to be without parameters,
-                    give it an explicit name instead with `, \"Type\"`",
-                ));
-                return Err(());
-            }
-        };
-
-        let generics = syn::Generics::default();
-
-        let mut item = self.item.clone();
-        item.segments.push(syn::PathSegment::from(name.clone()));
-
-        let type_hash = match crate::hash::build_type_hash(&item) {
-            Ok(type_hash) => type_hash,
-            Err(error) => {
-                cx.error(error);
-                return Err(());
-            }
-        };
-
-        let attr = TypeAttr::default();
-        let name = syn::LitStr::new(&name.to_string(), name.span());
-
-        Ok(TypeBuilder {
-            attr,
-            ident: self.path,
-            type_hash,
-            name,
-            installers: Vec::new(),
-            tokens,
-            generics,
+        Ok(Self {
+            attrs: syn::Attribute::parse_outer(input)?,
+            impl_token: input.parse()?,
+            params: if input.peek(Token![<]) {
+                Some(input.parse()?)
+            } else {
+                None
+            },
+            item: input.parse()?,
+            for_token: input.parse()?,
+            ty: input.parse()?,
         })
     }
 }
 
 /// An internal call to the macro.
-pub struct Derive {
-    input: syn::DeriveInput,
+pub struct InternalCall {
+    items: Vec<(InternalItem, Option<Token![;]>)>,
+}
+
+impl syn::parse::Parse for InternalCall {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut items = Vec::new();
+
+        while !input.is_empty() {
+            let item = input.parse()?;
+            let semi = input.parse::<Option<Token![;]>>()?;
+            let done = semi.is_none();
+
+            items.push((item, semi));
+
+            if done {
+                break;
+            }
+        }
+
+        Ok(Self { items })
+    }
+}
+
+impl InternalCall {
+    pub(super) fn into_any_builders<'a>(
+        self,
+        cx: &Context,
+        attr: &'a TypeAttr,
+        tokens: &'a Tokens,
+    ) -> Vec<TypeBuilder<'a, syn::Type>> {
+        let mut output = Vec::new();
+
+        for (item, _) in self.items {
+            let type_item = match crate::item::build_item(&item.item) {
+                Ok(type_item) => type_item,
+                Err(error) => {
+                    cx.error(error);
+                    continue;
+                }
+            };
+
+            let mut any = None;
+            let mut type_of = None;
+            let mut attrs = Vec::new();
+
+            for attr in item.attrs {
+                if attr.path().is_ident("any") {
+                    any = Some(attr.path().span());
+                    continue;
+                }
+
+                if attr.path().is_ident("type_of") {
+                    type_of = Some(attr.path().span());
+                    continue;
+                }
+
+                attrs.push(attr);
+            }
+
+            let args = crate::hash::Arguments::new(item.item);
+
+            let Ok(type_hash) = args.build_type_hash(cx) else {
+                continue;
+            };
+
+            let kind = match (any, type_of) {
+                (Some(a), Some(..)) => {
+                    cx.error(syn::Error::new(a, "Cannot combine #[any] and #[type_of]"));
+                    continue;
+                }
+                (Some(..), _) => TypeKind::Any,
+                (_, Some(..)) => TypeKind::TypeOf,
+                (None, None) => TypeKind::Derive,
+            };
+
+            output.push(TypeBuilder {
+                attr,
+                ident: item.ty,
+                type_hash,
+                type_item,
+                installers: Vec::new(),
+                tokens,
+                generics: syn::Generics::default(),
+                attrs,
+                params: item.params,
+                kind,
+            });
+        }
+
+        output
+    }
+}
+
+/// An internal call to the macro.
+pub(super) struct Derive {
+    pub(super) input: syn::DeriveInput,
 }
 
 impl syn::parse::Parse for Derive {
@@ -82,19 +147,13 @@ impl syn::parse::Parse for Derive {
 }
 
 impl Derive {
-    pub(super) fn into_any_builder(self, cx: &Context) -> Result<TypeBuilder<syn::Ident>, ()> {
-        let attr = cx.type_attrs(&self.input.attrs)?;
-
-        let tokens = cx.tokens_with_module(attr.module.as_ref());
-
+    pub(super) fn into_any_builder<'a>(
+        self,
+        cx: &Context,
+        attr: &'a TypeAttr,
+        tokens: &'a Tokens,
+    ) -> Result<TypeBuilder<'a, syn::Ident>, ()> {
         let mut installers = Vec::new();
-
-        expand_install_with(cx, &self.input, &tokens, &attr, &mut installers)?;
-
-        let name = match &attr.name {
-            Some(name) => name,
-            None => &self.input.ident,
-        };
 
         let mut item = match &attr.item {
             Some(item) => item.clone(),
@@ -104,26 +163,39 @@ impl Derive {
             },
         };
 
-        item.segments.push(syn::PathSegment::from(name.clone()));
-
-        let type_hash = match crate::hash::build_type_hash(&item) {
-            Ok(type_hash) => type_hash,
-            Err(error) => {
-                cx.error(error);
-                return Err(());
-            }
+        let name = match &attr.name {
+            Some(name) => name,
+            None => &self.input.ident,
         };
 
-        let name = syn::LitStr::new(&name.to_string(), name.span());
+        item.segments.push(syn::PathSegment::from(name.clone()));
+
+        let args = crate::hash::Arguments::new(item);
+        let type_item = args.build_type_item(cx)?;
+        let type_hash = args.build_type_hash(cx)?;
+
+        expand_install_with(cx, &self.input, tokens, attr, &mut installers, &args)?;
+
+        if matches!(&self.input.data, syn::Data::Enum(..)) {
+            if let Some(span) = attr.constructor {
+                cx.error(syn::Error::new(
+                    span,
+                    "#[rune(constructor)] is not supported on enums, only its variants",
+                ));
+            }
+        }
 
         Ok(TypeBuilder {
             attr,
             ident: self.input.ident,
             type_hash,
-            name,
+            type_item,
             installers,
             tokens,
             generics: self.input.generics,
+            attrs: Vec::new(),
+            params: None,
+            kind: TypeKind::Derive,
         })
     }
 }
@@ -135,6 +207,7 @@ pub(crate) fn expand_install_with(
     tokens: &Tokens,
     attr: &TypeAttr,
     installers: &mut Vec<TokenStream>,
+    args: &crate::hash::Arguments,
 ) -> Result<(), ()> {
     let ident = &input.ident;
 
@@ -143,7 +216,16 @@ pub(crate) fn expand_install_with(
             expand_struct_install_with(cx, installers, ident, st, tokens, attr)?;
         }
         syn::Data::Enum(en) => {
-            expand_enum_install_with(cx, installers, ident, en, tokens, attr, &input.generics)?;
+            expand_enum_install_with(
+                cx,
+                installers,
+                ident,
+                en,
+                tokens,
+                attr,
+                &input.generics,
+                args,
+            )?;
         }
         syn::Data::Union(..) => {
             cx.error(syn::Error::new_spanned(
@@ -153,13 +235,6 @@ pub(crate) fn expand_install_with(
             return Err(());
         }
     }
-
-    installers.extend(attr.protocols.iter().map(|protocol| protocol.expand()));
-    installers.extend(attr.functions.iter().map(|function| {
-        quote_spanned! {function.span()=>
-            module.function_meta(#function)?;
-        }
-    }));
 
     if let Some(install_with) = &attr.install_with {
         installers.push(quote_spanned! { input.span() =>
@@ -179,7 +254,7 @@ fn expand_struct_install_with(
     attr: &TypeAttr,
 ) -> Result<(), ()> {
     for (n, field) in st.fields.iter().enumerate() {
-        let attrs = cx.field_attrs(&field.attrs)?;
+        let attrs = cx.field_attrs(&field.attrs);
         let name;
         let index;
 
@@ -227,24 +302,12 @@ fn expand_struct_install_with(
 
     match &st.fields {
         syn::Fields::Named(fields) => {
-            let constructor = if attr.constructor {
-                let args = fields.named.iter().map(|f| {
-                    let ident = f.ident.as_ref().expect("named fields must have an Ident");
-                    let typ = &f.ty;
-                    quote!(#ident: #typ)
-                });
-
-                let field_names = fields.named.iter().map(|f| f.ident.as_ref());
-
-                Some(quote!(.constructor(|#(#args),*| {
-                    #ident {
-                        #(#field_names),*
-                    }
-                })?))
-            } else if let Some(x) = attr.constructor_fn.as_ref() {
-                Some(quote!(.constructor(#x)?))
+            let constructor = if let Some(ctor_fn) = attr.constructor_fn.as_ref() {
+                Some(quote!(.constructor(#ctor_fn)?))
             } else {
-                None
+                attr.constructor
+                    .is_some()
+                    .then(|| make_constructor(syn::parse_quote!(#ident), &fields.named))
             };
 
             let fields = fields.named.iter().flat_map(|f| {
@@ -253,7 +316,7 @@ fn expand_struct_install_with(
             });
 
             installers.push(quote! {
-                module.type_meta::<Self>()?.make_named_struct(&[#(#fields,)*])?#constructor.static_docs(&#docs)?;
+                module.type_meta::<Self>()?.make_named_struct(&[#(#fields,)*])?.static_docs(&#docs)?#constructor;
             });
         }
         syn::Fields::Unnamed(fields) => {
@@ -281,12 +344,16 @@ fn expand_enum_install_with(
     tokens: &Tokens,
     attr: &TypeAttr,
     generics: &syn::Generics,
+    args: &crate::hash::Arguments,
 ) -> Result<(), ()> {
     let Tokens {
         protocol,
+        runtime_error,
         to_value,
-        type_of,
         vm_result,
+        any_t,
+        hash,
+        vm_try,
         ..
     } = tokens;
 
@@ -305,7 +372,7 @@ fn expand_enum_install_with(
     for (variant_index, variant) in en.variants.iter().enumerate() {
         let span = variant.fields.span();
 
-        let variant_attr = cx.variant_attr(&variant.attrs)?;
+        let variant_attr = cx.variant_attr(&variant.attrs);
 
         let mut variant_docs = syn::ExprArray {
             attrs: Vec::new(),
@@ -318,16 +385,23 @@ fn expand_enum_install_with(
         }
 
         let variant_ident = &variant.ident;
-        variant_names.push(syn::LitStr::new(&variant_ident.to_string(), span));
+        let variant_name = variant_ident.to_string();
+        variant_names.push(syn::LitStr::new(&variant_name, span));
 
-        is_variant.push(quote!((#ident::#variant_ident { .. }, #variant_index) => true));
+        let Ok(variant_hash) = args.build_type_hash_with(cx, &variant_name) else {
+            continue;
+        };
+
+        let variant_hash = variant_hash.into_inner();
+
+        is_variant.push(quote!((#ident::#variant_ident { .. }, #hash(#variant_hash)) => true));
 
         match &variant.fields {
             syn::Fields::Named(fields) => {
                 let mut field_names = Vec::new();
 
                 for f in &fields.named {
-                    let attrs = cx.field_attrs(&f.attrs)?;
+                    let attrs = cx.field_attrs(&f.attrs);
 
                     let Some(f_ident) = &f.ident else {
                         cx.error(syn::Error::new_spanned(f, "Missing field name"));
@@ -341,18 +415,21 @@ fn expand_enum_install_with(
 
                         let fields = field_fns.entry(f_name).or_default();
 
-                        let value = if attrs.copy {
-                            quote!(#to_value::to_value(*#f_ident))
-                        } else {
-                            quote!(#to_value::to_value(#f_ident.clone()))
-                        };
-
-                        fields.push(quote!(#ident::#variant_ident { #f_ident, .. } => #value));
+                        let access = attrs.clone_with.decorate(tokens, quote!(#f_ident));
+                        fields.push(quote!(#ident::#variant_ident { #f_ident, .. } => #vm_result::Ok(#vm_try!(#to_value::to_value(#access)))));
                     }
                 }
 
+                let constructor = if let Some(ctor_fn) = variant_attr.constructor_fn.as_ref() {
+                    Some(quote!(.constructor(#ctor_fn)?))
+                } else {
+                    variant_attr.constructor.is_some().then(|| {
+                        make_constructor(syn::parse_quote!(#ident::#variant_ident), &fields.named)
+                    })
+                };
+
                 variant_metas.push(quote! {
-                    enum_.variant_mut(#variant_index)?.make_named(&[#(#field_names),*])?.static_docs(&#variant_docs)?
+                    enum_.variant_mut(#variant_index)?.make_named(&[#(#field_names),*])?.static_docs(&#variant_docs)?#constructor
                 });
 
                 variants.push((None, variant_attr));
@@ -362,20 +439,15 @@ fn expand_enum_install_with(
 
                 for (n, field) in fields.unnamed.iter().enumerate() {
                     let span = field.span();
-                    let attrs = cx.field_attrs(&field.attrs)?;
+                    let attrs = cx.field_attrs(&field.attrs);
 
                     if attrs.field {
                         fields_len += 1;
                         let fields = index_fns.entry(n).or_default();
                         let n = syn::LitInt::new(&n.to_string(), span);
 
-                        let value = if attrs.copy {
-                            quote!(#to_value::to_value(*value))
-                        } else {
-                            quote!(#to_value::to_value(value.clone()))
-                        };
-
-                        fields.push(quote!(#ident::#variant_ident { #n: value, .. } => #value));
+                        let access = attrs.clone_with.decorate(tokens, quote!(value));
+                        fields.push(quote!(#ident::#variant_ident { #n: value, .. } => #vm_result::Ok(#vm_try!(#to_value::to_value(#access)))));
                     }
                 }
 
@@ -383,15 +455,17 @@ fn expand_enum_install_with(
                     enum_.variant_mut(#variant_index)?.make_unnamed(#fields_len)?.static_docs(&#variant_docs)?
                 });
 
-                let constructor = if variant_attr.constructor {
-                    if fields_len != fields.unnamed.len() {
-                        cx.error(syn::Error::new_spanned(fields, "#[rune(constructor)] can only be used if all fields are marked with #[rune(get)"));
-                        return Err(());
-                    }
+                if variant_attr.constructor.is_some() && fields_len != fields.unnamed.len() {
+                    cx.error(syn::Error::new_spanned(fields, "#[rune(constructor)] can only be used if all fields are marked with #[rune(get)"));
+                }
 
-                    Some(quote!(#ident #type_generics :: #variant_ident))
+                let constructor = if let Some(ctor_fn) = variant_attr.constructor_fn.as_ref() {
+                    Some(quote!(.constructor(#ctor_fn)?))
                 } else {
-                    None
+                    variant_attr
+                        .constructor
+                        .is_some()
+                        .then(|| quote!(#ident #type_generics :: #variant_ident))
                 };
 
                 variants.push((constructor, variant_attr));
@@ -401,7 +475,14 @@ fn expand_enum_install_with(
                     enum_.variant_mut(#variant_index)?.make_empty()?.static_docs(&#variant_docs)?
                 });
 
-                let constructor = if variant_attr.constructor {
+                if variant_attr.constructor_fn.is_some() {
+                    cx.error(syn::Error::new(
+                        span,
+                        "#[rune(constructor_fn)] is not supported on unit variants",
+                    ));
+                }
+
+                let constructor = if variant_attr.constructor.is_some() {
                     Some(quote!(|| #ident #type_generics :: #variant_ident))
                 } else {
                     None
@@ -413,8 +494,8 @@ fn expand_enum_install_with(
     }
 
     let is_variant = quote! {
-        module.associated_function(#protocol::IS_VARIANT, |this: &Self, index: usize| {
-            match (this, index) {
+        module.associated_function(&#protocol::IS_VARIANT, |this: &Self, hash: #hash| {
+            match (this, hash) {
                 #(#is_variant,)*
                 _ => false,
             }
@@ -425,10 +506,14 @@ fn expand_enum_install_with(
 
     for (field, matches) in field_fns {
         installers.push(quote! {
-            module.field_function(#protocol::GET, #field, |this: &Self| {
+            module.field_function(&#protocol::GET, #field, |this: &Self| {
                 match this {
                     #(#matches,)*
-                    _ => return #vm_result::__rune_macros__unsupported_object_field_get(<Self as #type_of>::type_info()),
+                    _ => return #vm_result::err(
+                        #runtime_error::__rune_macros__unsupported_object_field_get(
+                            <Self as #any_t>::ANY_TYPE_INFO
+                        )
+                    ),
                 }
             })?;
         });
@@ -436,10 +521,15 @@ fn expand_enum_install_with(
 
     for (index, matches) in index_fns {
         installers.push(quote! {
-            module.index_function(#protocol::GET, #index, |this: &Self| {
+            module.index_function(&#protocol::GET, #index, |this: &Self| {
                 match this {
                     #(#matches,)*
-                    _ => return #vm_result::__rune_macros__unsupported_tuple_index_get(<Self as #type_of>::type_info(), #index),
+                    _ => return #vm_result::err(
+                        #runtime_error::__rune_macros__unsupported_tuple_index_get(
+                            <Self as #any_t>::ANY_TYPE_INFO,
+                            #index
+                        )
+                    ),
                 }
             })?;
         });
@@ -475,103 +565,148 @@ fn expand_enum_install_with(
 
         let constructor = constructor.as_ref().map(|c| quote!(.constructor(#c)?));
 
-        installers
-            .push(quote!(module.variant_meta::<Self>(#index)?#constructor.static_docs(&#docs)?;))
+        installers.push(quote! {
+                module.variant_meta::<Self>(#index)?.static_docs(&#docs)?#constructor;
+        });
     }
 
     Ok(())
 }
 
-pub struct TypeBuilder<T> {
-    attr: TypeAttr,
-    ident: T,
-    type_hash: Hash,
-    name: syn::LitStr,
-    installers: Vec<TokenStream>,
-    tokens: Tokens,
-    generics: syn::Generics,
+enum TypeKind {
+    Any,
+    TypeOf,
+    Derive,
 }
 
-impl<T> TypeBuilder<T>
+pub struct TypeBuilder<'a, T> {
+    attr: &'a TypeAttr,
+    ident: T,
+    /// Hash of the type.
+    type_hash: Hash,
+    /// Bytes corresponding to the item array.
+    type_item: syn::ExprArray,
+    installers: Vec<TokenStream>,
+    tokens: &'a Tokens,
+    generics: syn::Generics,
+    attrs: Vec<syn::Attribute>,
+    params: Option<Params>,
+    kind: TypeKind,
+}
+
+impl<T> TypeBuilder<'_, T>
 where
     T: ToTokens,
 {
     /// Expand the necessary implementation details for `Any`.
     pub(super) fn expand(self) -> TokenStream {
+        match self.kind {
+            TypeKind::Derive => self.expand_derive(),
+            TypeKind::Any => self.expand_any(),
+            TypeKind::TypeOf => self.expand_type_of(),
+        }
+    }
+
+    pub(super) fn expand_derive(self) -> TokenStream {
         let TypeBuilder {
             attr,
             ident,
             type_hash,
-            name,
+            type_item,
             installers,
             tokens,
             generics,
+            attrs,
+            ..
         } = self;
 
         let Tokens {
-            any,
+            alloc,
+            any_t,
+            any_marker_t,
             context_error,
+            fmt,
             hash,
+            install_with,
+            item,
+            maybe_type_of,
+            meta,
             module,
             named,
-            pointer_guard,
-            raw_into_mut,
-            raw_into_ref,
-            raw_str,
-            shared,
-            type_info,
-            any_type_info,
-            type_of,
-            maybe_type_of,
-            full_type_of,
-            unsafe_to_value,
-            unsafe_to_ref,
-            unsafe_to_mut,
-            value,
-            vm_result,
-            install_with,
             non_null,
-            box_,
-            static_type_mod,
-            from_value,
-            raw_ref,
-            raw_mut,
-            mut_,
-            ref_,
-            vm_try,
+            raw_value_guard,
+            result,
+            any_type_info,
+            type_hash_t,
+            type_of,
+            unsafe_to_mut,
+            unsafe_to_ref,
+            unsafe_to_value,
+            value_mut_guard,
+            value_ref_guard,
+            value,
+            write,
+            runtime_error,
             ..
-        } = &tokens;
+        } = tokens;
 
-        let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+        let empty;
+        let mut current;
+        let generic_names;
 
-        let generic_names = if attr.static_type.is_some() {
-            vec![]
-        } else {
-            generics.type_params().map(|v| &v.ident).collect::<Vec<_>>()
+        let (impl_generics, type_generics, where_clause) = match &attr.impl_params {
+            Some(params) => {
+                empty = syn::Generics::default();
+                current = syn::Generics::default();
+
+                for p in params {
+                    current.params.push(syn::GenericParam::Type(p.clone()));
+                }
+
+                let (impl_generics, _, where_clause) = empty.split_for_impl();
+                let (_, type_generics, _) = current.split_for_impl();
+                generic_names = Vec::new();
+                (impl_generics, type_generics, where_clause)
+            }
+            None => {
+                current = generics;
+                generic_names = current.type_params().map(|v| &v.ident).collect::<Vec<_>>();
+                current.split_for_impl()
+            }
         };
 
-        let impl_named = if !generic_names.is_empty() {
-            quote! {
-                #[automatically_derived]
-                impl #impl_generics #named for #ident #type_generics #where_clause {
-                    const BASE_NAME: #raw_str  = #raw_str::from_str(#name);
-
-                    fn full_name() -> #box_<str> {
-                        [#name, "<", &#(#generic_names::full_name(),)* ">"].join("").into_boxed_str()
-                    }
-                }
-            }
+        let named_rest = if let [first_name, remainder @ ..] = &generic_names[..] {
+            Some(quote! {
+                #write!(f, "<")?;
+                #first_name::full_name(f)?;
+                #(
+                    #write!(f, ", ")?;
+                    #remainder::full_name(f)?;
+                )*
+                #write!(f, ">")?;
+            })
         } else {
-            quote! {
-                #[automatically_derived]
-                impl #impl_generics #named for #ident #type_generics #where_clause {
-                    const BASE_NAME: #raw_str = #raw_str::from_str(#name);
+            None
+        };
+
+        let impl_named = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #named for #ident #type_generics #where_clause {
+                const ITEM: &'static #item = unsafe { #item::from_bytes(&#type_item) };
+
+                #[inline]
+                fn full_name(f: &mut #fmt::Formatter<'_>) -> #fmt::Result {
+                    #fmt::Display::fmt(Self::ITEM, f)?;
+                    #named_rest
+                    #result::Ok(())
                 }
             }
         };
 
         let install_with = quote! {
             #[automatically_derived]
+            #(#attrs)*
             impl #impl_generics #install_with for #ident #type_generics #where_clause {
                 fn install_with(#[allow(unused)] module: &mut #module) -> core::result::Result<(), #context_error> {
                     #(#installers)*
@@ -580,204 +715,390 @@ where
             }
         };
 
-        let impl_type_of = if attr.builtin.is_none() {
-            let type_parameters = if !generic_names.is_empty() {
-                quote!(#hash::parameters([#(<#generic_names as #type_of>::type_hash()),*]))
-            } else {
-                quote!(#hash::EMPTY)
-            };
+        let type_hash = type_hash.into_inner();
 
-            Some(quote! {
-                #[automatically_derived]
-                impl #impl_generics #type_of for #ident #type_generics #where_clause {
-                    #[inline]
-                    fn type_hash() -> #hash {
-                        <Self as #any>::type_hash()
-                    }
-
-                    #[inline]
-                    fn type_parameters() -> #hash {
-                        #type_parameters
-                    }
-
-                    #[inline]
-                    fn type_info() -> #type_info {
-                        #type_info::Any(#any_type_info::__private_new(
-                            #raw_str::from_str(core::any::type_name::<Self>()),
-                            <Self as #type_of>::type_hash(),
-                        ))
-                    }
-                }
-
-                #[automatically_derived]
-                impl #impl_generics #maybe_type_of for #ident #type_generics #where_clause {
-                    #[inline]
-                    fn maybe_type_of() -> Option<#full_type_of> {
-                        Some(<Self as #type_of>::type_of())
-                    }
-                }
-            })
-        } else if let Some(ty) = attr.static_type {
-            Some(quote! {
-                #[automatically_derived]
-                impl #impl_generics #type_of for #ident #type_generics #where_clause {
-                    #[inline]
-                    fn type_hash() -> #hash {
-                        #static_type_mod::#ty.hash
-                    }
-
-                    #[inline]
-                    fn type_info() -> #type_info {
-                        #type_info::StaticType(#static_type_mod::#ty)
-                    }
-                }
-
-                #[automatically_derived]
-                impl #impl_generics #maybe_type_of for #ident #type_generics #where_clause {
-                    #[inline]
-                    fn maybe_type_of() -> Option<#full_type_of> {
-                        Some(<Self as #type_of>::type_of())
-                    }
-                }
-            })
+        let make_hash = if !generic_names.is_empty() {
+            quote!(#hash::new_with_type_parameters(#type_hash, #hash::parameters([#(<#generic_names as #type_hash_t>::HASH),*])))
         } else {
-            None
+            quote!(#hash::new(#type_hash))
         };
 
-        let any = if attr.builtin.is_none() {
-            let type_hash = type_hash.into_inner();
+        let type_parameters =
+            quote!(#hash::parameters([#(<#generic_names as #type_hash_t>::HASH),*]));
 
-            let make_hash = if !generic_names.is_empty() {
-                quote!(#hash::new_with_type_parameters(#type_hash, #hash::parameters([#(<#generic_names as #type_of>::type_hash()),*])))
-            } else {
-                quote!(#hash::new(#type_hash))
-            };
+        let to_value_impl = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_ref for #ident #type_generics #where_clause {
+                type Guard = #raw_value_guard;
 
-            Some(quote! {
-                #[automatically_derived]
-                impl #impl_generics #any for #ident #type_generics #where_clause {
-                    fn type_hash() -> #hash {
-                        #make_hash
-                    }
+                #[inline]
+                unsafe fn unsafe_to_ref<'a>(value: #value) -> #result<(&'a Self, Self::Guard), #runtime_error> {
+                    let (value, guard) = #value::into_any_ref_ptr(value)?;
+                    #result::Ok((#non_null::as_ref(&value), guard))
                 }
+            }
 
-                #[automatically_derived]
-                impl #impl_generics #unsafe_to_ref for #ident #type_generics #where_clause {
-                    type Guard = #raw_into_ref;
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_mut for #ident #type_generics #where_clause {
+                type Guard = #raw_value_guard;
 
-                    unsafe fn unsafe_to_ref<'a>(value: #value) -> #vm_result<(&'a Self, Self::Guard)> {
-                        let (value, guard) = #vm_try!(value.into_any_ptr());
-                        #vm_result::Ok((#non_null::as_ref(&value), guard))
-                    }
+                #[inline]
+                unsafe fn unsafe_to_mut<'a>(value: #value) -> #result<(&'a mut Self, Self::Guard), #runtime_error> {
+                    let (mut value, guard) = #value::into_any_mut_ptr(value)?;
+                    #result::Ok((#non_null::as_mut(&mut value), guard))
                 }
+            }
 
-                #[automatically_derived]
-                impl #impl_generics #unsafe_to_mut for #ident #type_generics #where_clause {
-                    type Guard = #raw_into_mut;
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_value for &#ident #type_generics #where_clause {
+                type Guard = #value_ref_guard;
 
-                    unsafe fn unsafe_to_mut<'a>(value: #value) -> #vm_result<(&'a mut Self, Self::Guard)> {
-                        let (mut value, guard) = #vm_try!(value.into_any_mut());
-                        #vm_result::Ok((#non_null::as_mut(&mut value), guard))
-                    }
+                #[inline]
+                unsafe fn unsafe_to_value(self) -> #result<(#value, Self::Guard), #runtime_error> {
+                    let (shared, guard) = #value::from_ref(self)?;
+                    #result::Ok((shared, guard))
                 }
+            }
 
-                #[automatically_derived]
-                impl #impl_generics #unsafe_to_value for &#ident #type_generics #where_clause {
-                    type Guard = #pointer_guard;
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_value for &mut #ident #type_generics #where_clause {
+                type Guard = #value_mut_guard;
 
-                    unsafe fn unsafe_to_value(self) -> #vm_result<(#value, Self::Guard)> {
-                        let (shared, guard) = #vm_try!(#shared::from_ref(self));
-                        #vm_result::Ok((#value::from(shared), guard))
-                    }
+                #[inline]
+                unsafe fn unsafe_to_value(self) -> #result<(#value, Self::Guard), #runtime_error> {
+                    let (shared, guard) = #value::from_mut(self)?;
+                    #result::Ok((shared, guard))
                 }
-
-                #[automatically_derived]
-                impl #impl_generics #unsafe_to_value for &mut #ident #type_generics #where_clause {
-                    type Guard = #pointer_guard;
-
-                    unsafe fn unsafe_to_value(self) -> #vm_result<(#value, Self::Guard)> {
-                        let (shared, guard) = #vm_try!(#shared::from_mut(self));
-                        #vm_result::Ok((#value::from(shared), guard))
-                    }
-                }
-            })
-        } else {
-            None
+            }
         };
 
-        let impl_from_value = 'out: {
-            if let Some(path) = attr.from_value {
-                let ty = match &attr.from_value_params {
-                    Some(params) => quote!(#ident<#params>),
-                    None if generics.params.is_empty() => quote!(#ident),
-                    _ => break 'out None,
-                };
+        let impl_type_of = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #type_hash_t for #ident #type_generics #where_clause {
+                const HASH: #hash = #make_hash;
+            }
 
-                Some(quote! {
-                    impl #from_value for #ty {
-                        fn from_value(value: Value) -> #vm_result<Self> {
-                            let value = #vm_try!(#path(value));
-                            let value = #vm_try!(#shared::take(value));
-                            #vm_result::Ok(value)
-                        }
-                    }
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #type_of for #ident #type_generics #where_clause {
+                const PARAMETERS: #hash = #type_parameters;
+                const STATIC_TYPE_INFO: #any_type_info = <Self as #any_t>::ANY_TYPE_INFO;
+            }
 
-                    impl #unsafe_to_ref for #ty {
-                        type Guard = #raw_ref;
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #maybe_type_of for #ident #type_generics #where_clause {
+                #[inline]
+                fn maybe_type_of() -> #alloc::Result<#meta::DocType> {
+                    #meta::DocType::with_generics(
+                        <Self as #type_hash_t>::HASH,
+                        [#(<#generic_names as #maybe_type_of>::maybe_type_of()?),*]
+                    )
+                }
+            }
+        };
 
-                        unsafe fn unsafe_to_ref<'a>(value: #value) -> #vm_result<(&'a Self, Self::Guard)> {
-                            let value = #vm_try!(#path(value));
-                            let value = #vm_try!(#shared::into_ref(value));
-                            let (value, guard) = #ref_::into_raw(value);
-                            #vm_result::Ok((value.as_ref(), guard))
-                        }
-                    }
+        let impl_any = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #any_t for #ident #type_generics #where_clause {
+            }
+        };
 
-                    impl #unsafe_to_mut for #ty {
-                        type Guard = #raw_mut;
-
-                        unsafe fn unsafe_to_mut<'a>(value: #value) -> #vm_result<(&'a mut Self, Self::Guard)> {
-                            let value = #vm_try!(#path(value));
-                            let value = #vm_try!(#shared::into_mut(value));
-                            let (mut value, guard) = #mut_::into_raw(value);
-                            #vm_result::Ok((value.as_mut(), guard))
-                        }
-                    }
-
-                    impl #from_value for #shared<#ty> {
-                        #[inline]
-                        fn from_value(value: #value) -> #vm_result<Self> {
-                            #path(value)
-                        }
-                    }
-
-                    impl #from_value for #ref_<#ty> {
-                        fn from_value(value: Value) -> #vm_result<Self> {
-                            let value = #vm_try!(#path(value));
-                            let value = #vm_try!(#shared::into_ref(value));
-                            #vm_result::Ok(value)
-                        }
-                    }
-
-                    impl #from_value for #mut_<#ty> {
-                        fn from_value(value: Value) -> #vm_result<Self> {
-                            let value = #vm_try!(#path(value));
-                            let value = #vm_try!(#shared::into_mut(value));
-                            #vm_result::Ok(value)
-                        }
-                    }
-                })
-            } else {
-                None
+        let impl_non_generic = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #any_marker_t for #ident #type_generics #where_clause {
             }
         };
 
         quote! {
             #install_with
             #impl_named
+            #to_value_impl
             #impl_type_of
-            #impl_from_value
-            #any
+            #impl_any
+            #impl_non_generic
         }
+    }
+
+    pub(super) fn expand_any(self) -> TokenStream {
+        let TypeBuilder {
+            ident,
+            type_item,
+            installers,
+            tokens,
+            generics,
+            attrs,
+            ..
+        } = self;
+
+        let Tokens {
+            any_t,
+            context_error,
+            fmt,
+            install_with,
+            item,
+            module,
+            named,
+            non_null,
+            raw_value_guard,
+            result,
+            unsafe_to_mut,
+            unsafe_to_ref,
+            unsafe_to_value,
+            value_mut_guard,
+            value_ref_guard,
+            value,
+            write,
+            runtime_error,
+            ..
+        } = tokens;
+
+        let generic_names = generics.type_params().map(|v| &v.ident).collect::<Vec<_>>();
+        let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+
+        let named_rest = if let [first_name, remainder @ ..] = &generic_names[..] {
+            Some(quote! {
+                #write!(f, "<")?;
+                #first_name::full_name(f)?;
+                #(
+                    #write!(f, ", ")?;
+                    #remainder::full_name(f)?;
+                )*
+                #write!(f, ">")?;
+            })
+        } else {
+            None
+        };
+
+        let impl_named = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #named for #ident #type_generics #where_clause {
+                const ITEM: &'static #item = unsafe { #item::from_bytes(&#type_item) };
+
+                #[inline]
+                fn full_name(f: &mut #fmt::Formatter<'_>) -> #fmt::Result {
+                    #fmt::Display::fmt(Self::ITEM, f)?;
+                    #named_rest
+                    #result::Ok(())
+                }
+            }
+        };
+
+        let install_with = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #install_with for #ident #type_generics #where_clause {
+                fn install_with(#[allow(unused)] module: &mut #module) -> core::result::Result<(), #context_error> {
+                    #(#installers)*
+                    Ok(())
+                }
+            }
+        };
+
+        let to_value_impl = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_ref for #ident #type_generics #where_clause {
+                type Guard = #raw_value_guard;
+
+                #[inline]
+                unsafe fn unsafe_to_ref<'a>(value: #value) -> #result<(&'a Self, Self::Guard), #runtime_error> {
+                    let (value, guard) = #value::into_any_ref_ptr(value)?;
+                    #result::Ok((#non_null::as_ref(&value), guard))
+                }
+            }
+
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_mut for #ident #type_generics #where_clause {
+                type Guard = #raw_value_guard;
+
+                #[inline]
+                unsafe fn unsafe_to_mut<'a>(value: #value) -> #result<(&'a mut Self, Self::Guard), #runtime_error> {
+                    let (mut value, guard) = #value::into_any_mut_ptr(value)?;
+                    #result::Ok((#non_null::as_mut(&mut value), guard))
+                }
+            }
+
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_value for &#ident #type_generics #where_clause {
+                type Guard = #value_ref_guard;
+
+                #[inline]
+                unsafe fn unsafe_to_value(self) -> #result<(#value, Self::Guard), #runtime_error> {
+                    let (shared, guard) = #value::from_ref(self)?;
+                    #result::Ok((shared, guard))
+                }
+            }
+
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #unsafe_to_value for &mut #ident #type_generics #where_clause {
+                type Guard = #value_mut_guard;
+
+                #[inline]
+                unsafe fn unsafe_to_value(self) -> #result<(#value, Self::Guard), #runtime_error> {
+                    let (shared, guard) = #value::from_mut(self)?;
+                    #result::Ok((shared, guard))
+                }
+            }
+        };
+
+        let impl_any = quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #impl_generics #any_t for #ident #type_generics #where_clause {
+            }
+        };
+
+        quote! {
+            #install_with
+            #impl_named
+            #to_value_impl
+            #impl_any
+        }
+    }
+
+    pub(super) fn expand_type_of(self) -> TokenStream {
+        let TypeBuilder {
+            ident,
+            type_item,
+            tokens,
+            attrs,
+            params,
+            type_hash,
+            ..
+        } = self;
+
+        let Tokens {
+            type_hash_t,
+            hash,
+            maybe_type_of,
+            any_type_info,
+            fmt,
+            meta,
+            item,
+            type_of,
+            alloc,
+            ..
+        } = tokens;
+
+        let p = params
+            .as_ref()
+            .into_iter()
+            .flat_map(|p| p.params.iter())
+            .collect::<Vec<_>>();
+
+        let type_hash = type_hash.into_inner();
+        let make_hash = quote!(#hash::new(#type_hash));
+
+        quote! {
+            #[automatically_derived]
+            #(#attrs)*
+            impl #params #type_hash_t for #ident {
+                const HASH: #hash = #make_hash;
+            }
+
+            #[automatically_derived]
+            #(#attrs)*
+            impl #params #type_of for #ident
+            where
+                #(#p: #maybe_type_of,)*
+            {
+                const STATIC_TYPE_INFO: #any_type_info = #any_type_info::new(
+                    {
+                        fn full_name(f: &mut #fmt::Formatter<'_>) -> #fmt::Result {
+                            write!(f, "{}", unsafe { #item::from_bytes(&#type_item) })
+                        }
+
+                        full_name
+                    },
+                    <Self as #type_hash_t>::HASH,
+                );
+            }
+
+            #[automatically_derived]
+            #(#attrs)*
+            impl #params #maybe_type_of for #ident
+            where
+                #(#p: #maybe_type_of,)*
+            {
+                #[inline]
+                fn maybe_type_of() -> #alloc::Result<#meta::DocType> {
+                    Ok(#meta::DocType::new(<Self as #type_hash_t>::HASH))
+                }
+            }
+        }
+    }
+}
+
+struct Params {
+    lt_token: Token![<],
+    params: Punctuated<syn::Ident, Token![,]>,
+    gt_token: Token![>],
+}
+
+impl syn::parse::Parse for Params {
+    #[inline]
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let lt_token: Token![<] = input.parse()?;
+
+        let mut params = Punctuated::new();
+
+        loop {
+            if input.peek(Token![>]) {
+                break;
+            }
+
+            params.push_value(input.parse()?);
+
+            if input.peek(Token![>]) {
+                break;
+            }
+
+            params.push_punct(input.parse()?);
+        }
+
+        Ok(Self {
+            lt_token,
+            params,
+            gt_token: input.parse()?,
+        })
+    }
+}
+
+impl ToTokens for Params {
+    #[inline]
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.lt_token.to_tokens(tokens);
+        self.params.to_tokens(tokens);
+        self.gt_token.to_tokens(tokens);
+    }
+}
+
+fn make_constructor(path: syn::Path, named: &Punctuated<syn::Field, Token![,]>) -> TokenStream {
+    let args = named.iter().flat_map(|f| {
+        let ident = f.ident.as_ref()?;
+        let typ = &f.ty;
+        Some(quote!(#ident: #typ))
+    });
+
+    let field_names = named.iter().flat_map(|f| f.ident.as_ref());
+
+    quote! {
+        .constructor(|#(#args),*| {
+            #path {
+                #(#field_names),*
+            }
+        })?
     }
 }

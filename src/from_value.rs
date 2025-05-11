@@ -1,14 +1,14 @@
 use crate::context::{Context, Tokens};
 use proc_macro2::TokenStream;
-use quote::quote_spanned;
+use quote::{quote, quote_spanned};
 use syn::spanned::Spanned as _;
 
-struct Expander {
-    cx: Context,
+struct Expander<'cx> {
+    cx: &'cx Context,
     tokens: Tokens,
 }
 
-impl Expander {
+impl Expander<'_> {
     /// Expand on a struct.
     fn expand_struct(
         &mut self,
@@ -19,22 +19,22 @@ impl Expander {
 
         let Tokens {
             value,
+            type_value,
             from_value,
-            vm_result,
+            result,
             tuple,
-            vm_try,
+            runtime_error,
             ..
         } = &self.tokens;
 
         let (expanded, expected) = match &st.fields {
             syn::Fields::Unit => {
-                let expanded = quote_spanned! {
-                    input.span() =>
-                    #value::EmptyTuple => {
-                        #vm_result::Ok(Self)
+                let expanded = quote! {
+                    #type_value::Unit => {
+                        #result::Ok(Self)
                     }
-                    #value::EmptyStruct(..) => {
-                        #vm_result::Ok(Self)
+                    #type_value::EmptyStruct(..) => {
+                        #result::Ok(Self)
                     }
                 };
 
@@ -43,19 +43,16 @@ impl Expander {
             syn::Fields::Unnamed(f) => {
                 let expanded = self.expand_unnamed(f)?;
 
-                let expanded = quote_spanned! {
-                    f.span() =>
-                    #value::EmptyTuple => {
+                let expanded = quote! {
+                    #type_value::Unit => {
                         let tuple = #tuple::new(&[]);
-                        #vm_result::Ok(Self(#expanded))
+                        #result::Ok(Self(#expanded))
                     }
-                    #value::Tuple(tuple) => {
-                        let tuple = #vm_try!(tuple.borrow_ref());
-                        #vm_result::Ok(Self(#expanded))
+                    #type_value::Tuple(tuple) => {
+                        #result::Ok(Self(#expanded))
                     }
-                    #value::TupleStruct(tuple) => {
-                        let tuple = #vm_try!(tuple.borrow_ref());
-                        #vm_result::Ok(Self(#expanded))
+                    #type_value::TupleStruct(tuple) => {
+                        #result::Ok(Self(#expanded))
                     }
                 };
 
@@ -64,15 +61,12 @@ impl Expander {
             syn::Fields::Named(f) => {
                 let expanded = self.expand_named(f)?;
 
-                let expanded = quote_spanned! {
-                    f.span() =>
-                    #value::Object(object) => {
-                        let object = #vm_try!(object.borrow_ref());
-                        #vm_result::Ok(Self { #expanded })
+                let expanded = quote! {
+                    #type_value::Object(object) => {
+                        #result::Ok(Self { #expanded })
                     }
-                    #value::Struct(object) => {
-                        let object = #vm_try!(object.borrow_ref());
-                        #vm_result::Ok(Self { #expanded })
+                    #type_value::Struct(object) => {
+                        #result::Ok(Self { #expanded })
                     }
                 };
 
@@ -80,14 +74,14 @@ impl Expander {
             }
         };
 
-        Ok(quote_spanned! { input.span() =>
+        Ok(quote! {
             #[automatically_derived]
             impl #from_value for #ident {
-                fn from_value(value: #value) -> #vm_result<Self> {
-                    match value {
+                fn from_value(value: #value) -> #result<Self, #runtime_error> {
+                    match #value::as_type_value(&value)? {
                         #expanded
                         actual => {
-                            #vm_result::expected::<#expected>(#vm_try!(actual.type_info()))
+                            #result::Err(#runtime_error::expected::<#expected>(#type_value::type_info(&actual)))
                         }
                     }
                 }
@@ -108,11 +102,11 @@ impl Expander {
         let ident = &input.ident;
 
         let Tokens {
+            type_value,
             from_value,
-            variant_data,
             value,
-            vm_result,
-            vm_try,
+            result,
+            runtime_error,
             ..
         } = &self.tokens;
 
@@ -122,63 +116,71 @@ impl Expander {
 
             match &variant.fields {
                 syn::Fields::Unit => {
-                    unit_matches.push(quote_spanned! { variant.span() =>
-                        #lit_str => #vm_result::Ok(Self::#ident)
+                    unit_matches.push(quote! {
+                        #lit_str => #result::Ok(Self::#ident)
                     });
                 }
                 syn::Fields::Unnamed(named) => {
                     let expanded = self.expand_unnamed(named)?;
 
-                    unnamed_matches.push(quote_spanned! { variant.span() =>
-                        #lit_str => #vm_result::Ok(Self::#ident ( #expanded ))
+                    unnamed_matches.push(quote! {
+                        #lit_str => #result::Ok(Self::#ident ( #expanded ))
                     });
                 }
                 syn::Fields::Named(named) => {
                     let expanded = self.expand_named(named)?;
 
-                    named_matches.push(quote_spanned! { variant.span() =>
-                        #lit_str => #vm_result::Ok(Self::#ident { #expanded })
+                    named_matches.push(quote! {
+                        #lit_str => #result::Ok(Self::#ident { #expanded })
                     });
                 }
             }
         }
 
-        let missing = quote_spanned! { input.span() =>
-            name => #vm_try!(#vm_result::__rune_macros__missing_variant(name))
+        let missing = quote! {
+            name => {
+                return #result::Err(#runtime_error::__rune_macros__missing_variant(name)?);
+            }
         };
 
-        let variant = quote_spanned! { input.span() =>
-            #value::Variant(variant) => {
-                let variant = #vm_try!(variant.borrow_ref());
-                let mut it = variant.rtti().item.iter();
-
-                let name = match it.next_back_str() {
-                    Some(name) => name,
-                    None => return #vm_result::__rune_macros__missing_variant_name(),
+        let variant = quote! {
+            #type_value::EmptyStruct(data) => {
+                let Some(name) = data.rtti().item().base_name() else {
+                    return #result::Err(#runtime_error::__rune_macros__missing_variant_name());
                 };
 
-                match variant.data() {
-                    #variant_data::Empty => match name {
-                        #(#unit_matches,)* #missing,
-                    },
-                    #variant_data::Tuple(tuple) => match name {
-                        #(#unnamed_matches,)* #missing,
-                    },
-                    #variant_data::Struct(object) => match name {
-                        #(#named_matches,)* #missing,
-                    },
+                match name {
+                    #(#unit_matches,)* #missing,
+                }
+            }
+            #type_value::TupleStruct(tuple) => {
+                let Some(name) = tuple.rtti().item().base_name() else {
+                    return #result::Err(#runtime_error::__rune_macros__missing_variant_name());
+                };
+
+                match name {
+                    #(#unnamed_matches,)* #missing,
+                }
+            }
+            #type_value::Struct(object) => {
+                let Some(name) = object.rtti().item().base_name() else {
+                    return #result::Err(#runtime_error::__rune_macros__missing_variant_name());
+                };
+
+                match name {
+                    #(#named_matches,)* #missing,
                 }
             }
         };
 
-        Ok(quote_spanned! { input.span() =>
+        Ok(quote! {
             #[automatically_derived]
             impl #from_value for #ident {
-                fn from_value(value: #value) -> #vm_result<Self> {
-                    match value {
+                fn from_value(value: #value) -> #result<Self, #runtime_error> {
+                    match #value::as_type_value(&value)? {
                         #variant,
                         actual => {
-                            #vm_result::__rune_macros__expected_variant(#vm_try!(actual.type_info()))
+                            #result::Err(#runtime_error::__rune_macros__expected_variant(#type_value::type_info(&actual)))
                         }
                     }
                 }
@@ -206,22 +208,24 @@ impl Expander {
 
         let Tokens {
             from_value,
-            vm_result,
+            result,
             type_name,
-            vm_try,
-            clone,
+            try_clone,
+            runtime_error,
             ..
         } = &self.tokens;
 
         for (index, field) in unnamed.unnamed.iter().enumerate() {
-            let _ = self.cx.field_attrs(&field.attrs)?;
+            let _ = self.cx.field_attrs(&field.attrs);
 
-            from_values.push(quote_spanned! {
-                field.span() =>
+            from_values.push(quote! {
                 match tuple.get(#index) {
-                    Some(value) => #vm_try!(#from_value::from_value(#clone::clone(value))),
+                    Some(value) => {
+                        let value = #try_clone::try_clone(value)?;
+                        #from_value::from_value(value)?
+                    }
                     None => {
-                        return #vm_result::__rune_macros__missing_tuple_index(#type_name::<Self>(), #index);
+                        return #result::Err(#runtime_error::__rune_macros__missing_tuple_index(#type_name::<Self>(), #index));
                     }
                 }
             });
@@ -236,62 +240,49 @@ impl Expander {
 
         for field in &named.named {
             let ident = self.field_ident(field)?;
-            let _ = self.cx.field_attrs(&field.attrs)?;
+            let _ = self.cx.field_attrs(&field.attrs);
 
             let name = &syn::LitStr::new(&ident.to_string(), ident.span());
 
             let Tokens {
                 from_value,
-                vm_result,
+                result,
+                runtime_error,
                 type_name,
-                vm_try,
                 ..
             } = &self.tokens;
 
             from_values.push(quote_spanned! {
                 field.span() =>
                 #ident: match object.get(#name) {
-                    Some(value) => #vm_try!(#from_value::from_value(value.clone())),
+                    Some(value) => #from_value::from_value(value.clone())?,
                     None => {
-                        return #vm_result::__rune_macros__missing_struct_field(#type_name::<Self>(), #name);
+                        return #result::Err(#runtime_error::__rune_macros__missing_struct_field(#type_name::<Self>(), #name));
                     }
                 }
             });
         }
 
-        Ok(quote_spanned!(named.span() => #(#from_values),* ))
+        Ok(quote!(#(#from_values),*))
     }
 }
 
-pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::Error>> {
-    let cx = Context::new();
-
-    let Ok(attr) = cx.type_attrs(&input.attrs) else {
-        return Err(cx.errors.into_inner());
-    };
-
+pub(super) fn expand(cx: &Context, input: &syn::DeriveInput) -> Result<TokenStream, ()> {
+    let attr = cx.type_attrs(&input.attrs);
     let tokens = cx.tokens_with_module(attr.module.as_ref());
 
     let mut expander = Expander { cx, tokens };
 
     match &input.data {
-        syn::Data::Struct(st) => {
-            if let Ok(expanded) = expander.expand_struct(input, st) {
-                return Ok(expanded);
-            }
-        }
-        syn::Data::Enum(en) => {
-            if let Ok(expanded) = expander.expand_enum(input, en) {
-                return Ok(expanded);
-            }
-        }
+        syn::Data::Struct(st) => expander.expand_struct(input, st),
+        syn::Data::Enum(en) => expander.expand_enum(input, en),
         syn::Data::Union(un) => {
             expander.cx.error(syn::Error::new_spanned(
                 un.union_token,
                 "not supported on unions",
             ));
+
+            Err(())
         }
     }
-
-    Err(expander.cx.errors.into_inner())
 }

@@ -2,12 +2,12 @@ use crate::context::{Context, Tokens};
 use proc_macro2::TokenStream;
 use quote::quote;
 
-struct Expander {
-    cx: Context,
+struct Expander<'cx> {
+    cx: &'cx Context,
     tokens: Tokens,
 }
 
-impl Expander {
+impl Expander<'_> {
     /// Expand on a struct.
     fn expand_struct(
         &mut self,
@@ -20,15 +20,16 @@ impl Expander {
 
         let Tokens {
             value,
-            vm_result,
             to_value,
+            result,
+            runtime_error,
             ..
         } = &self.tokens;
 
         Ok(quote! {
             #[automatically_derived]
             impl #to_value for #ident {
-                fn to_value(self) -> #vm_result<#value> {
+                fn to_value(self) -> #result<#value, #runtime_error> {
                     #inner
                 }
             }
@@ -55,42 +56,42 @@ impl Expander {
         let mut to_values = Vec::new();
 
         let Tokens {
-            to_value,
-            value,
+            alloc,
             owned_tuple,
-            vm_result,
-            vm_try,
+            result,
+            to_value,
             try_from,
-            vec,
+            value,
             ..
         } = &self.tokens;
 
         for (index, f) in unnamed.unnamed.iter().enumerate() {
-            let _ = self.cx.field_attrs(&f.attrs)?;
+            _ = self.cx.field_attrs(&f.attrs);
             let index = syn::Index::from(index);
-            to_values.push(quote!(#vm_try!(#vec::try_push(&mut tuple, #vm_try!(#to_value::to_value(self.#index))))));
+            to_values.push(
+                quote!(#alloc::Vec::try_push(&mut tuple, #to_value::to_value(self.#index)?)?),
+            );
         }
 
         let cap = unnamed.unnamed.len();
 
         Ok(quote! {
-            let mut tuple = #vm_try!(#vec::try_with_capacity(#cap));
+            let mut tuple = #alloc::Vec::try_with_capacity(#cap)?;
             #(#to_values;)*
-            let tuple = #vm_try!(<#owned_tuple as #try_from<_>>::try_from(tuple));
-            #vm_result::Ok(#vm_try!(<#value as #try_from<_>>::try_from(tuple)))
+            let tuple = <#owned_tuple as #try_from<_>>::try_from(tuple)?;
+            #result::Ok(<#value as #try_from<_>>::try_from(tuple)?)
         })
     }
 
     /// Expand named fields.
     fn expand_named(&mut self, named: &syn::FieldsNamed) -> Result<TokenStream, ()> {
         let Tokens {
-            to_value,
-            value,
+            alloc,
             object,
-            vm_result,
-            vm_try,
-            string,
+            result,
+            to_value,
             try_from,
+            value,
             ..
         } = &self.tokens;
 
@@ -98,36 +99,28 @@ impl Expander {
 
         for f in &named.named {
             let ident = self.cx.field_ident(f)?;
-            let _ = self.cx.field_attrs(&f.attrs)?;
+            _ = self.cx.field_attrs(&f.attrs);
 
-            let name = &syn::LitStr::new(&ident.to_string(), ident.span());
+            let name = syn::LitStr::new(&ident.to_string(), ident.span());
 
             to_values.push(quote! {
-                object.insert(#vm_try!(<#string as #try_from<_>>::try_from(#name)), #vm_try!(#to_value::to_value(self.#ident)))
+                object.insert(<#alloc::String as #try_from<_>>::try_from(#name)?, #to_value::to_value(self.#ident)?)?
             });
         }
 
         Ok(quote! {
             let mut object = <#object>::new();
             #(#to_values;)*
-            #vm_result::Ok(#vm_try!(<#value as #try_from<_>>::try_from(object)))
+            #result::Ok(<#value as #try_from<_>>::try_from(object)?)
         })
     }
 }
 
-pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::Error>> {
-    let cx = Context::new();
-
-    let Ok(attr) = cx.type_attrs(&input.attrs) else {
-        return Err(cx.errors.into_inner());
-    };
-
+pub(super) fn expand(cx: &Context, input: &syn::DeriveInput) -> Result<TokenStream, ()> {
+    let attr = cx.type_attrs(&input.attrs);
     let tokens = cx.tokens_with_module(attr.module.as_ref());
 
-    let mut expander = Expander {
-        cx: Context::new(),
-        tokens,
-    };
+    let mut expander = Expander { cx, tokens };
 
     match &input.data {
         syn::Data::Struct(st) => {
@@ -149,5 +142,5 @@ pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::E
         }
     }
 
-    Err(expander.cx.errors.into_inner())
+    Err(())
 }
