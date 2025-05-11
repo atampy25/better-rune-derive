@@ -135,6 +135,11 @@ pub(crate) struct TypeAttr {
     pub(crate) docs: Vec<syn::Expr>,
     /// Method to use to convert from value.
     pub(crate) impl_params: Option<syn::punctuated::Punctuated<syn::TypeParam, Token![,]>>,
+
+    /// `#[rune_derive(..)]`
+    pub(crate) protocols: Vec<TypeProtocol>,
+    /// `#[rune_functions(..)]`.
+    pub(crate) functions: Vec<syn::Path>,
 }
 
 /// Parsed #[const_value(..)] field attributes.
@@ -180,6 +185,66 @@ pub(crate) struct Generate<'a> {
 pub(crate) struct FieldProtocol {
     pub(crate) generate: fn(Generate<'_>) -> TokenStream,
     custom: Option<syn::Path>,
+}
+
+pub(crate) struct TypeProtocol {
+    protocol: syn::Ident,
+    handler: Option<syn::Expr>,
+}
+
+impl TypeProtocol {
+    pub fn expand(&self) -> TokenStream {
+        if let Some(handler) = &self.handler {
+            let protocol = &self.protocol;
+            return quote_spanned! {protocol.span()=>
+                module.associated_function(rune::runtime::Protocol::#protocol, #handler)?;
+            };
+        }
+        match self.protocol.to_string().as_str() {
+            "ADD" => quote_spanned! {self.protocol.span()=>
+                module.associated_function(rune::runtime::Protocol::ADD, |this: Self, other: Self| this + other)?;
+            },
+            "DISPLAY_FMT" => quote_spanned! {self.protocol.span()=>
+                module.associated_function(rune::runtime::Protocol::DISPLAY_FMT, |this: &Self, f: &mut rune::runtime::Formatter| {
+                    use rune::alloc::fmt::TryWrite;
+                    rune::vm_write!(f, "{}", this);
+                    rune::runtime::VmResult::Ok(())
+                })?;
+            },
+            "DEBUG_FMT" => quote_spanned! {self.protocol.span()=>
+                module.associated_function(rune::runtime::Protocol::DEBUG_FMT, |this: &Self, f: &mut rune::runtime::Formatter| {
+                    use rune::alloc::fmt::TryWrite;
+                    rune::vm_write!(f, "{:?}", this);
+                    rune::runtime::VmResult::Ok(())
+                })?;
+            },
+            _ => unreachable!("`parse()` ensures only supported protocols"),
+        }
+    }
+}
+
+impl syn::parse::Parse for TypeProtocol {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let it = Self {
+            protocol: input.parse()?,
+            handler: if input.parse::<Token![=]>().is_ok() {
+                Some(input.parse()?)
+            } else {
+                None
+            },
+        };
+
+        if it.handler.is_some()
+            || ["ADD", "DISPLAY_FMT", "DEBUG_FMT"].contains(&it.protocol.to_string().as_str())
+        {
+            Ok(it)
+        } else {
+            Err(syn::Error::new_spanned(
+                &it.protocol,
+                format!("Rune protocol `{}` cannot be derived", it.protocol),
+            ))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -644,11 +709,8 @@ impl Context {
                 continue;
             }
 
-            if !a.path().is_ident(RUNE) {
-                continue;
-            }
-
-            let result = a.parse_nested_meta(|meta| {
+            if a.path().is_ident(RUNE) {
+                let result = a.parse_nested_meta(|meta| {
                 if meta.path.is_ident("parse") {
                     meta.input.parse::<Token![=]>()?;
                     let s: syn::LitStr = meta.input.parse()?;
@@ -750,9 +812,28 @@ impl Context {
                 ))
             });
 
-            if let Err(e) = result {
-                self.error(e);
-            };
+                if let Err(e) = result {
+                    self.error(e);
+                };
+            } else if a.path().is_ident("rune_derive") {
+                match a.parse_args_with(Punctuated::<_, Token![,]>::parse_terminated) {
+                    Ok(protocols) => {
+                        attr.protocols.extend(protocols);
+                    }
+                    Err(e) => {
+                        self.error(e);
+                    }
+                };
+            } else if a.path().is_ident("rune_functions") {
+                match a.parse_args_with(Punctuated::<_, Token![,]>::parse_terminated) {
+                    Ok(functions) => {
+                        attr.functions.extend(functions);
+                    }
+                    Err(e) => {
+                        self.error(e);
+                    }
+                };
+            }
         }
 
         attr

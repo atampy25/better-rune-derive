@@ -211,6 +211,13 @@ pub(crate) fn expand_install_with(
 ) -> Result<(), ()> {
     let ident = &input.ident;
 
+    installers.extend(attr.protocols.iter().map(|protocol| protocol.expand()));
+    installers.extend(attr.functions.iter().map(|function| {
+        quote_spanned! {function.span()=>
+            module.function_meta(#function)?;
+        }
+    }));
+
     match &input.data {
         syn::Data::Struct(st) => {
             expand_struct_install_with(cx, installers, ident, st, tokens, attr)?;
