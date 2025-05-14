@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned, ToTokens};
 use rune_core::hash::Hash;
-use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::Token;
+use syn::{parse_str, Token};
+use syn::{punctuated::Punctuated, Type};
 
-use crate::context::{Context, Generate, GenerateTarget, Tokens, TypeAttr};
+use crate::context::{CloneWith, Context, FieldAttrs, Generate, GenerateTarget, Tokens, TypeAttr};
 
 struct InternalItem {
     attrs: Vec<syn::Attribute>,
@@ -260,10 +260,13 @@ fn expand_struct_install_with(
     tokens: &Tokens,
     attr: &TypeAttr,
 ) -> Result<(), ()> {
+    let mut field_attrs = Vec::new();
     for (n, field) in st.fields.iter().enumerate() {
         let attrs = cx.field_attrs(&field.attrs);
         let name;
         let index;
+
+        field_attrs.push(attrs.clone());
 
         let target = match &field.ident {
             Some(ident) => {
@@ -312,9 +315,9 @@ fn expand_struct_install_with(
             let constructor = if let Some(ctor_fn) = attr.constructor_fn.as_ref() {
                 Some(quote!(.constructor(#ctor_fn)?))
             } else {
-                attr.constructor
-                    .is_some()
-                    .then(|| make_constructor(syn::parse_quote!(#ident), &fields.named))
+                attr.constructor.is_some().then(|| {
+                    make_constructor(syn::parse_quote!(#ident), &fields.named, &field_attrs)
+                })
             };
 
             let fields = fields.named.iter().flat_map(|f| {
@@ -406,9 +409,12 @@ fn expand_enum_install_with(
         match &variant.fields {
             syn::Fields::Named(fields) => {
                 let mut field_names = Vec::new();
+                let mut field_attrs = Vec::new();
 
                 for f in &fields.named {
                     let attrs = cx.field_attrs(&f.attrs);
+
+                    field_attrs.push(attrs.clone());
 
                     let Some(f_ident) = &f.ident else {
                         cx.error(syn::Error::new_spanned(f, "Missing field name"));
@@ -431,7 +437,11 @@ fn expand_enum_install_with(
                     Some(quote!(.constructor(#ctor_fn)?))
                 } else {
                     variant_attr.constructor.is_some().then(|| {
-                        make_constructor(syn::parse_quote!(#ident::#variant_ident), &fields.named)
+                        make_constructor(
+                            syn::parse_quote!(#ident::#variant_ident),
+                            &fields.named,
+                            &field_attrs,
+                        )
                     })
                 };
 
@@ -1092,14 +1102,58 @@ impl ToTokens for Params {
     }
 }
 
-fn make_constructor(path: syn::Path, named: &Punctuated<syn::Field, Token![,]>) -> TokenStream {
-    let args = named.iter().flat_map(|f| {
+fn make_constructor(
+    path: syn::Path,
+    named: &Punctuated<syn::Field, Token![,]>,
+    field_attrs: &[FieldAttrs],
+) -> TokenStream {
+    let args = named.iter().enumerate().flat_map(|(idx, f)| {
         let ident = f.ident.as_ref()?;
         let typ = &f.ty;
-        Some(quote!(#ident: #typ))
+
+        if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
+            // Remove Box<> from type
+            let typ = parse_str::<syn::Type>(
+                typ.clone()
+                    .into_token_stream()
+                    .to_string()
+                    .strip_prefix("Box <")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Expected Box<T>, got {}",
+                            typ.clone().into_token_stream().to_string()
+                        )
+                    })
+                    .strip_suffix(" >")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Expected Box<T>, got {}",
+                            typ.clone().into_token_stream().to_string()
+                        )
+                    }),
+            )
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Expected Box<T>, got {}",
+                    typ.clone().into_token_stream().to_string()
+                )
+            });
+
+            Some(quote!(#ident: #typ))
+        } else {
+            Some(quote!(#ident: #typ))
+        }
     });
 
-    let field_names = named.iter().flat_map(|f| f.ident.as_ref());
+    let field_names = named.iter().enumerate().flat_map(|(idx, f)| {
+        if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
+            f.ident
+                .as_ref()
+                .map(|x| quote!(#x: ::std::boxed::Box::new(#x)))
+        } else {
+            f.ident.as_ref().map(|x| x.into_token_stream())
+        }
+    });
 
     quote! {
         .constructor(|#(#args),*| {

@@ -14,7 +14,7 @@ keywords = ["language", "scripting", "scripting-language"]
 categories = ["parser-implementations"]
 
 [dependencies]
-rune-core = { version = "=0.14.0", features = ["std"] }
+rune-core = { git = "https://github.com/rune-rs/rune", rev = "a8c4f97", features = ["std"] }
 syn = { version = "2.0.16", features = ["full"] }
 quote = "1.0.27"
 proc-macro2 = "1.0.56"
@@ -23,5 +23,5 @@ proc-macro2 = "1.0.56"
 proc-macro = true
 
 [dev-dependencies]
-rune = "=0.14.0"
-rune-core = "=0.14.0"
+rune = { git = "https://github.com/rune-rs/rune", rev = "a8c4f97" }
+rune-core = { git = "https://github.com/rune-rs/rune", rev = "a8c4f97" }

@@ -5,8 +5,11 @@ use proc_macro2::TokenStream;
 use quote::quote_spanned;
 use quote::{quote, ToTokens};
 use syn::parse::ParseStream;
+use syn::parse2;
+use syn::parse_str;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned as _;
+use syn::Error;
 use syn::Token;
 
 use rune_core::protocol::Protocol;
@@ -16,9 +19,9 @@ use super::RUNE;
 #[derive(Default, Clone)]
 pub(super) enum CloneWith {
     /// Use `rune::alloc::clone::TryClone`.
-    #[default]
     TryClone,
     /// Use `::alloc::clone::Clone`.
+    #[default]
     Clone,
     /// The field is `Copy`.
     Copy,
@@ -26,6 +29,8 @@ pub(super) enum CloneWith {
     With(syn::Path),
     /// The field can be fallibly cloned with the given function.
     TryWith(syn::Path),
+    /// Use `::alloc::clone::Clone`, before/after boxing/unboxing.
+    BoxedClone,
 }
 
 impl CloneWith {
@@ -53,12 +58,15 @@ impl CloneWith {
             Self::TryWith(path) => {
                 quote!(#vm_try!(#path(#access)))
             }
+            Self::BoxedClone => {
+                quote!(#clone::clone(&**#access))
+            }
         }
     }
 }
 
 /// Parsed `#[rune(..)]` field attributes.
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[must_use = "Attributes must be used or explicitly ignored"]
 pub(crate) struct FieldAttrs {
     /// A field that is an identifier. Should use `Default::default` to be
@@ -182,6 +190,7 @@ pub(crate) struct Generate<'a> {
     pub(crate) target: GenerateTarget<'a>,
 }
 
+#[derive(Clone)]
 pub(crate) struct FieldProtocol {
     pub(crate) generate: fn(Generate<'_>) -> TokenStream,
     custom: Option<syn::Path>,
@@ -202,20 +211,18 @@ impl TypeProtocol {
         }
         match self.protocol.to_string().as_str() {
             "ADD" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::ADD, |this: Self, other: Self| this + other)?;
+                module.associated_function(&rune::runtime::Protocol::ADD, |this: Self, other: Self| this + other)?;
             },
             "DISPLAY_FMT" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::DISPLAY_FMT, |this: &Self, f: &mut rune::runtime::Formatter| {
+                module.associated_function(&rune::runtime::Protocol::DISPLAY_FMT, |this: &Self, f: &mut rune::runtime::Formatter| {
                     use rune::alloc::fmt::TryWrite;
-                    rune::vm_write!(f, "{}", this);
-                    rune::runtime::VmResult::Ok(())
+                    rune::vm_write!(f, "{}", this)
                 })?;
             },
             "DEBUG_FMT" => quote_spanned! {self.protocol.span()=>
-                module.associated_function(rune::runtime::Protocol::DEBUG_FMT, |this: &Self, f: &mut rune::runtime::Formatter| {
+                module.associated_function(&rune::runtime::Protocol::DEBUG_FMT, |this: &Self, f: &mut rune::runtime::Formatter| {
                     use rune::alloc::fmt::TryWrite;
-                    rune::vm_write!(f, "{:?}", this);
-                    rune::runtime::VmResult::Ok(())
+                    rune::vm_write!(f, "{:?}", this)
                 })?;
             },
             _ => unreachable!("`parse()` ensures only supported protocols"),
@@ -528,6 +535,11 @@ impl Context {
                     return Ok(());
                 }
 
+                if meta.path.is_ident("boxed") {
+                    attr.clone_with = CloneWith::BoxedClone;
+                    return Ok(());
+                }
+
                 if meta.path.is_ident("copy") {
                     attr.clone_with = CloneWith::Copy;
                     return Ok(());
@@ -617,19 +629,61 @@ impl Context {
 
                             let protocol = g.tokens.protocol(&Protocol::SET);
 
-                            match target {
-                                GenerateTarget::Named { field_ident, field_name } => {
-                                    quote_spanned! { g.field.span() =>
-                                        module.field_function(&#protocol, #field_name, |s: &mut Self, value: #ty| {
-                                            s.#field_ident = value;
-                                        })?;
+                            let ty = if matches!(g.attrs.clone_with, CloneWith::BoxedClone) {
+                                parse_str::<syn::Type>(ty
+                                    .clone()
+                                    .into_token_stream()
+                                    .to_string()
+                                    .strip_prefix("Box <")
+                                    .unwrap_or_else(|| panic!(
+                                        "Expected Box<T>, got {}",
+                                        ty.clone().into_token_stream().to_string()
+                                    ))
+                                    .strip_suffix(" >")
+                                    .unwrap_or_else(|| panic!(
+                                        "Expected Box<T>, got {}",
+                                        ty.clone().into_token_stream().to_string()
+                                    )))
+                                    .unwrap_or_else(|_| panic!(
+                                        "Expected Box<T>, got {}",
+                                        ty.clone().into_token_stream().to_string()
+                                    ))
+                            } else {
+                                ty.to_owned()
+                            };
+
+                            if matches!(g.attrs.clone_with, CloneWith::BoxedClone){
+                                match target {
+                                    GenerateTarget::Named { field_ident, field_name } => {
+                                        quote_spanned! { g.field.span() =>
+                                            module.field_function(&#protocol, #field_name, |s: &mut Self, value: #ty| {
+                                                s.#field_ident = ::std::boxed::Box::new(value);
+                                            })?;
+                                        }
+                                    }
+                                    GenerateTarget::Numbered { field_index } => {
+                                        quote_spanned! { g.field.span() =>
+                                            module.index_function(&#protocol, #field_index, |s: &mut Self, value: #ty| {
+                                                s.#field_index = ::std::boxed::Box::new(value);
+                                            })?;
+                                        }
                                     }
                                 }
-                                GenerateTarget::Numbered { field_index } => {
-                                    quote_spanned! { g.field.span() =>
-                                        module.index_function(&#protocol, #field_index, |s: &mut Self, value: #ty| {
-                                            s.#field_index = value;
-                                        })?;
+                            } else {
+                                match target {
+                                    GenerateTarget::Named { field_ident, field_name } => {
+                                        quote_spanned! { g.field.span() =>
+                                            module.field_function(&#protocol, #field_name, |s: &mut Self, value: #ty| {
+                                                s.#field_ident = value;
+                                            })?;
+                                        }
+                                    }
+                                    GenerateTarget::Numbered { field_index } => {
+                                        quote_spanned! { g.field.span() =>
+                                            module.index_function(&#protocol, #field_index, |s: &mut Self, value: #ty| {
+                                                s.#field_index = value;
+                                            })?;
+                                        }
                                     }
                                 }
                             }
@@ -880,7 +934,7 @@ impl Context {
                             "#[rune(constructor)] or #[rune(constructor_fn)] must only be used once",
                         ));
                     }
-                    
+
                     if attr.constructor_fn.is_some() {
                         return Err(syn::Error::new(
                             meta.path.span(),
