@@ -4,6 +4,7 @@ use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::quote_spanned;
 use quote::{quote, ToTokens};
+use syn::parenthesized;
 use syn::parse::ParseStream;
 use syn::parse2;
 use syn::parse_str;
@@ -90,6 +91,8 @@ pub(crate) struct FieldAttrs {
     pub(crate) clone_with: CloneWith,
     /// Whether this field should be known at compile time or not.
     pub(crate) field: bool,
+    /// Whether this field should be treated as a different type, converted with From/Into.
+    pub(crate) as_into: Option<syn::Path>,
 }
 
 impl FieldAttrs {
@@ -562,6 +565,12 @@ impl Context {
                     return Ok(());
                 }
 
+                if meta.path.is_ident("as_into") {
+                    meta.input.parse::<Token![=]>()?;
+                    attr.as_into = Some(meta.input.parse()?);
+                    return Ok(());
+                }
+
                 if meta.path.is_ident("parse_with") {
                     if let Some(old) = &attr.parse_with {
                         let mut error = syn::Error::new_spanned(
@@ -593,21 +602,46 @@ impl Context {
                                 ..
                             } = g.tokens;
 
-                            match target {
-                                GenerateTarget::Named { field_ident, field_name } => {
-                                    let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_ident));
-                                    let protocol = g.tokens.protocol(&Protocol::GET);
+                            if let Some(as_into) = &g.attrs.as_into {
+                                match target {
+                                    GenerateTarget::Named { field_ident, field_name } => {
+                                        let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_ident));
+                                        let protocol = g.tokens.protocol(&Protocol::GET);
+                                        let ty = g.ty;
 
-                                    quote_spanned! { g.field.span() =>
-                                        module.field_function(&#protocol, #field_name, |s: &Self| #vm_result::Ok(#access))?;
+                                        quote_spanned! { g.field.span() =>
+                                            module.field_function(&#protocol, #field_name, |s: &Self| #vm_result::Ok(<#as_into as std::convert::From<#ty>>::from(#access)))?;
+                                        }
+                                    }
+
+                                    GenerateTarget::Numbered { field_index } => {
+                                        let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_index));
+                                        let protocol = g.tokens.protocol(&Protocol::GET);
+                                        let ty = g.ty;
+
+                                        quote_spanned! { g.field.span() =>
+                                            module.index_function(&#protocol, #field_index, |s: &Self| #vm_result::Ok(<#as_into as std::convert::From<#ty>>::from(#access)))?;
+                                        }
                                     }
                                 }
-                                GenerateTarget::Numbered { field_index } => {
-                                    let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_index));
-                                    let protocol = g.tokens.protocol(&Protocol::GET);
+                            } else {
+                                match target {
+                                    GenerateTarget::Named { field_ident, field_name } => {
+                                        let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_ident));
+                                        let protocol = g.tokens.protocol(&Protocol::GET);
 
-                                    quote_spanned! { g.field.span() =>
-                                        module.index_function(&#protocol, #field_index, |s: &Self| #vm_result::Ok(#access))?;
+                                        quote_spanned! { g.field.span() =>
+                                            module.field_function(&#protocol, #field_name, |s: &Self| #vm_result::Ok(#access))?;
+                                        }
+                                    }
+
+                                    GenerateTarget::Numbered { field_index } => {
+                                        let access = g.attrs.clone_with.decorate(g.tokens, quote!(&s.#field_index));
+                                        let protocol = g.tokens.protocol(&Protocol::GET);
+
+                                        quote_spanned! { g.field.span() =>
+                                            module.index_function(&#protocol, #field_index, |s: &Self| #vm_result::Ok(#access))?;
+                                        }
                                     }
                                 }
                             }
@@ -637,34 +671,54 @@ impl Context {
                                     .strip_prefix("Box <")
                                     .unwrap_or_else(|| panic!(
                                         "Expected Box<T>, got {}",
-                                        ty.clone().into_token_stream().to_string()
+                                        ty.clone().into_token_stream()
                                     ))
                                     .strip_suffix(" >")
                                     .unwrap_or_else(|| panic!(
                                         "Expected Box<T>, got {}",
-                                        ty.clone().into_token_stream().to_string()
+                                        ty.clone().into_token_stream()
                                     )))
                                     .unwrap_or_else(|_| panic!(
                                         "Expected Box<T>, got {}",
-                                        ty.clone().into_token_stream().to_string()
+                                        ty.clone().into_token_stream()
                                     ))
                             } else {
                                 ty.to_owned()
                             };
 
-                            if matches!(g.attrs.clone_with, CloneWith::BoxedClone){
+                            let ty = if let Some(as_into) = &g.attrs.as_into {
+                                parse_str::<syn::Type>(&as_into
+                                    .clone()
+                                    .into_token_stream()
+                                    .to_string())
+                                    .unwrap_or_else(|_| panic!(
+                                        "Expected type, got {}",
+                                        as_into.clone().into_token_stream()
+                                    ))
+                            } else {
+                                ty
+                            };
+
+                            
+                            let converted_value = if let Some(as_into) = &g.attrs.as_into {
+                                quote_spanned! { g.field.span() => ::std::convert::From::<#as_into>::from(value) }
+                            } else {
+                                quote_spanned! { g.field.span() => value }
+                            };
+
+                            if matches!(g.attrs.clone_with, CloneWith::BoxedClone) {
                                 match target {
                                     GenerateTarget::Named { field_ident, field_name } => {
                                         quote_spanned! { g.field.span() =>
                                             module.field_function(&#protocol, #field_name, |s: &mut Self, value: #ty| {
-                                                s.#field_ident = ::std::boxed::Box::new(value);
+                                                s.#field_ident = ::std::boxed::Box::new(#converted_value);
                                             })?;
                                         }
                                     }
                                     GenerateTarget::Numbered { field_index } => {
                                         quote_spanned! { g.field.span() =>
                                             module.index_function(&#protocol, #field_index, |s: &mut Self, value: #ty| {
-                                                s.#field_index = ::std::boxed::Box::new(value);
+                                                s.#field_index = ::std::boxed::Box::new(#converted_value);
                                             })?;
                                         }
                                     }
@@ -674,14 +728,14 @@ impl Context {
                                     GenerateTarget::Named { field_ident, field_name } => {
                                         quote_spanned! { g.field.span() =>
                                             module.field_function(&#protocol, #field_name, |s: &mut Self, value: #ty| {
-                                                s.#field_ident = value;
+                                                s.#field_ident = #converted_value;
                                             })?;
                                         }
                                     }
                                     GenerateTarget::Numbered { field_index } => {
                                         quote_spanned! { g.field.span() =>
                                             module.index_function(&#protocol, #field_index, |s: &mut Self, value: #ty| {
-                                                s.#field_index = value;
+                                                s.#field_index = #converted_value;
                                             })?;
                                         }
                                     }

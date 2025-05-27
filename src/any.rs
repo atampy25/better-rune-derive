@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{ToTokens, quote, quote_spanned};
 use rune_core::hash::Hash;
 use syn::spanned::Spanned;
-use syn::{parse_str, Token};
-use syn::{punctuated::Punctuated, Type};
+use syn::{Ident, Token, parse_str};
+use syn::{Type, punctuated::Punctuated};
 
 use crate::context::{CloneWith, Context, FieldAttrs, Generate, GenerateTarget, Tokens, TypeAttr};
 
@@ -1111,7 +1111,9 @@ fn make_constructor(
         let ident = f.ident.as_ref()?;
         let typ = &f.ty;
 
-        if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
+        if let Some(as_into) = &field_attrs[idx].as_into {
+            Some(quote!(#ident: #as_into))
+        } else if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
             // Remove Box<> from type
             let typ = parse_str::<syn::Type>(
                 typ.clone()
@@ -1119,25 +1121,14 @@ fn make_constructor(
                     .to_string()
                     .strip_prefix("Box <")
                     .unwrap_or_else(|| {
-                        panic!(
-                            "Expected Box<T>, got {}",
-                            typ.clone().into_token_stream().to_string()
-                        )
+                        panic!("Expected Box<T>, got {}", typ.clone().into_token_stream())
                     })
                     .strip_suffix(" >")
                     .unwrap_or_else(|| {
-                        panic!(
-                            "Expected Box<T>, got {}",
-                            typ.clone().into_token_stream().to_string()
-                        )
+                        panic!("Expected Box<T>, got {}", typ.clone().into_token_stream())
                     }),
             )
-            .unwrap_or_else(|_| {
-                panic!(
-                    "Expected Box<T>, got {}",
-                    typ.clone().into_token_stream().to_string()
-                )
-            });
+            .unwrap_or_else(|_| panic!("Expected Box<T>, got {}", typ.clone().into_token_stream()));
 
             Some(quote!(#ident: #typ))
         } else {
@@ -1146,12 +1137,24 @@ fn make_constructor(
     });
 
     let field_names = named.iter().enumerate().flat_map(|(idx, f)| {
+        let val = |x: &Ident| {
+            if let Some(as_into) = &field_attrs[idx].as_into {
+                quote!(::std::convert::From::<#as_into>::from(#x))
+            } else {
+                quote!(#x)
+            }
+        };
+
         if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
-            f.ident
-                .as_ref()
-                .map(|x| quote!(#x: ::std::boxed::Box::new(#x)))
+            f.ident.as_ref().map(|x| {
+                let y = val(x);
+                quote!(#x: ::std::boxed::Box::new(#y))
+            })
         } else {
-            f.ident.as_ref().map(|x| x.into_token_stream())
+            f.ident.as_ref().map(|x| {
+                let y = val(x);
+                quote!(#x: #y)
+            })
         }
     });
 
