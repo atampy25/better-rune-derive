@@ -228,6 +228,12 @@ impl TypeProtocol {
                     rune::vm_write!(f, "{:?}", this)
                 })?;
             },
+            "PARTIAL_EQ" => quote_spanned! {self.protocol.span()=>
+                module.associated_function(&rune::runtime::Protocol::PARTIAL_EQ, |this: &Self, other: &Self| this == other)?;
+            },
+            "EQ" => quote_spanned! {self.protocol.span()=>
+                module.associated_function(&rune::runtime::Protocol::EQ, |this: &Self, other: &Self| this == other)?;
+            },
             _ => unreachable!("`parse()` ensures only supported protocols"),
         }
     }
@@ -245,7 +251,7 @@ impl syn::parse::Parse for TypeProtocol {
         };
 
         if it.handler.is_some()
-            || ["ADD", "DISPLAY_FMT", "DEBUG_FMT"].contains(&it.protocol.to_string().as_str())
+            || ["ADD", "DISPLAY_FMT", "DEBUG_FMT", "PARTIAL_EQ", "EQ"].contains(&it.protocol.to_string().as_str())
         {
             Ok(it)
         } else {
