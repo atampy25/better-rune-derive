@@ -479,20 +479,8 @@ fn expand_enum_install_with(
                     }
                 }
 
-                let constructor = if let Some(ctor_fn) = variant_attr.constructor_fn.as_ref() {
-                    Some(quote!(.constructor(#ctor_fn)?))
-                } else {
-                    variant_attr.constructor.is_some().then(|| {
-                        make_tuple_constructor(
-                            syn::parse_quote!(#ident::#variant_ident),
-                            &fields.unnamed,
-                            &field_attrs,
-                        )
-                    })
-                };
-
                 variant_metas.push(quote! {
-                    enum_.variant_mut(#variant_index)?.make_unnamed(#fields_len)?.static_docs(&#variant_docs)?#constructor
+                    enum_.variant_mut(#variant_index)?.make_unnamed(#fields_len)?.static_docs(&#variant_docs)?
                 });
 
                 if variant_attr.constructor.is_some() && fields_len != fields.unnamed.len() {
