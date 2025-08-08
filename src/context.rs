@@ -234,6 +234,9 @@ impl TypeProtocol {
             "EQ" => quote_spanned! {self.protocol.span()=>
                 module.associated_function(&rune::runtime::Protocol::EQ, |this: &Self, other: &Self| this == other)?;
             },
+            "CLONE" => quote_spanned! {self.protocol.span()=>
+                module.associated_function(&rune::runtime::Protocol::CLONE, |this: &Self| this.clone())?;
+            },
             _ => unreachable!("`parse()` ensures only supported protocols"),
         }
     }
@@ -251,7 +254,7 @@ impl syn::parse::Parse for TypeProtocol {
         };
 
         if it.handler.is_some()
-            || ["ADD", "DISPLAY_FMT", "DEBUG_FMT", "PARTIAL_EQ", "EQ"].contains(&it.protocol.to_string().as_str())
+            || ["ADD", "DISPLAY_FMT", "DEBUG_FMT", "PARTIAL_EQ", "EQ", "CLONE"].contains(&it.protocol.to_string().as_str())
         {
             Ok(it)
         } else {
@@ -541,6 +544,11 @@ impl Context {
 
                 if meta.path.is_ident("span") {
                     attr.span = Some(meta.path.span());
+                    return Ok(());
+                }
+
+                if meta.path.is_ident("try_clone") {
+                    attr.clone_with = CloneWith::TryClone;
                     return Ok(());
                 }
 

@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
-use quote::{ToTokens, quote, quote_spanned};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use rune_core::hash::Hash;
 use syn::spanned::Spanned;
-use syn::{Ident, Token, parse_str};
-use syn::{Type, punctuated::Punctuated};
+use syn::{parse_str, Ident, Token};
+use syn::{punctuated::Punctuated, Type};
 
 use crate::context::{CloneWith, Context, FieldAttrs, Generate, GenerateTarget, Tokens, TypeAttr};
 
@@ -330,10 +330,18 @@ fn expand_struct_install_with(
             });
         }
         syn::Fields::Unnamed(fields) => {
+            let constructor = if let Some(ctor_fn) = attr.constructor_fn.as_ref() {
+                Some(quote!(.constructor(#ctor_fn)?))
+            } else {
+                attr.constructor.is_some().then(|| {
+                    make_tuple_constructor(syn::parse_quote!(#ident), &fields.unnamed, &field_attrs)
+                })
+            };
+
             let len = fields.unnamed.len();
 
             installers.push(quote! {
-                module.type_meta::<Self>()?.make_unnamed_struct(#len)?.static_docs(&#docs)?;
+                module.type_meta::<Self>()?.make_unnamed_struct(#len)?.static_docs(&#docs)?#constructor;
             });
         }
         syn::Fields::Unit => {
@@ -453,10 +461,13 @@ fn expand_enum_install_with(
             }
             syn::Fields::Unnamed(fields) => {
                 let mut fields_len = 0usize;
+                let mut field_attrs = Vec::new();
 
                 for (n, field) in fields.unnamed.iter().enumerate() {
                     let span = field.span();
                     let attrs = cx.field_attrs(&field.attrs);
+
+                    field_attrs.push(attrs.clone());
 
                     if attrs.field {
                         fields_len += 1;
@@ -468,8 +479,20 @@ fn expand_enum_install_with(
                     }
                 }
 
+                let constructor = if let Some(ctor_fn) = variant_attr.constructor_fn.as_ref() {
+                    Some(quote!(.constructor(#ctor_fn)?))
+                } else {
+                    variant_attr.constructor.is_some().then(|| {
+                        make_tuple_constructor(
+                            syn::parse_quote!(#ident::#variant_ident),
+                            &fields.unnamed,
+                            &field_attrs,
+                        )
+                    })
+                };
+
                 variant_metas.push(quote! {
-                    enum_.variant_mut(#variant_index)?.make_unnamed(#fields_len)?.static_docs(&#variant_docs)?
+                    enum_.variant_mut(#variant_index)?.make_unnamed(#fields_len)?.static_docs(&#variant_docs)?#constructor
                 });
 
                 if variant_attr.constructor.is_some() && fields_len != fields.unnamed.len() {
@@ -1099,6 +1122,62 @@ impl ToTokens for Params {
         self.lt_token.to_tokens(tokens);
         self.params.to_tokens(tokens);
         self.gt_token.to_tokens(tokens);
+    }
+}
+
+fn make_tuple_constructor(
+    path: syn::Path,
+    unnamed: &Punctuated<syn::Field, Token![,]>,
+    field_attrs: &[FieldAttrs],
+) -> TokenStream {
+    let args = unnamed.iter().enumerate().map(|(idx, f)| {
+        let ident = format_ident!("v{}", idx);
+        let typ = &f.ty;
+
+        if let Some(as_into) = &field_attrs[idx].as_into {
+            quote!(#ident: #as_into)
+        } else if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
+            // Remove Box<> from type
+            let typ = parse_str::<syn::Type>(
+                typ.clone()
+                    .into_token_stream()
+                    .to_string()
+                    .strip_prefix("Box <")
+                    .unwrap_or_else(|| {
+                        panic!("Expected Box<T>, got {}", typ.clone().into_token_stream())
+                    })
+                    .strip_suffix(" >")
+                    .unwrap_or_else(|| {
+                        panic!("Expected Box<T>, got {}", typ.clone().into_token_stream())
+                    }),
+            )
+            .unwrap_or_else(|_| panic!("Expected Box<T>, got {}", typ.clone().into_token_stream()));
+
+            quote!(#ident: #typ)
+        } else {
+            quote!(#ident: #typ)
+        }
+    });
+
+    let field_values = unnamed.iter().enumerate().map(|(idx, _)| {
+        let ident = format_ident!("v{}", idx);
+        let val = if let Some(as_into) = &field_attrs[idx].as_into {
+            quote!(::std::convert::From::<#as_into>::from(#ident))
+        } else {
+            quote!(#ident)
+        };
+
+        if matches!(field_attrs[idx].clone_with, CloneWith::BoxedClone) {
+            quote!(::std::boxed::Box::new(#val))
+        } else {
+            val
+        }
+    });
+
+    quote! {
+        .constructor(|#(#args),*| {
+            #path(#(#field_values),*)
+        })?
     }
 }
 
