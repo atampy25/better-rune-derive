@@ -454,10 +454,10 @@ fn expand_enum_install_with(
                 };
 
                 variant_metas.push(quote! {
-                    enum_.variant_mut(#variant_index)?.make_named(&[#(#field_names),*])?.static_docs(&#variant_docs)?#constructor
+                    enum_.variant_mut(#variant_index)?.make_named(&[#(#field_names),*])?.static_docs(&#variant_docs)?
                 });
 
-                variants.push((None, variant_attr));
+                variants.push((constructor, variant_attr));
             }
             syn::Fields::Unnamed(fields) => {
                 let mut fields_len = 0usize;
@@ -490,10 +490,13 @@ fn expand_enum_install_with(
                 let constructor = if let Some(ctor_fn) = variant_attr.constructor_fn.as_ref() {
                     Some(quote!(.constructor(#ctor_fn)?))
                 } else {
-                    variant_attr
-                        .constructor
-                        .is_some()
-                        .then(|| quote!(#ident #type_generics :: #variant_ident))
+                    variant_attr.constructor.is_some().then(|| {
+                        make_tuple_constructor(
+                            syn::parse_quote!(#ident #type_generics :: #variant_ident),
+                            &fields.unnamed,
+                            &field_attrs,
+                        )
+                    })
                 };
 
                 variants.push((constructor, variant_attr));
@@ -511,7 +514,7 @@ fn expand_enum_install_with(
                 }
 
                 let constructor = if variant_attr.constructor.is_some() {
-                    Some(quote!(|| #ident #type_generics :: #variant_ident))
+                    Some(quote!(.constructor(|| #ident #type_generics :: #variant_ident)?))
                 } else {
                     None
                 };
@@ -591,10 +594,8 @@ fn expand_enum_install_with(
             docs.elems.push(el.clone());
         }
 
-        let constructor = constructor.as_ref().map(|c| quote!(.constructor(#c)?));
-
         installers.push(quote! {
-                module.variant_meta::<Self>(#index)?.static_docs(&#docs)?#constructor;
+            module.variant_meta::<Self>(#index)?.static_docs(&#docs)?#constructor;
         });
     }
 
