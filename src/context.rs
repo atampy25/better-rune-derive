@@ -4,13 +4,10 @@ use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::quote_spanned;
 use quote::{quote, ToTokens};
-use syn::parenthesized;
 use syn::parse::ParseStream;
-use syn::parse2;
 use syn::parse_str;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned as _;
-use syn::Error;
 use syn::Token;
 
 use rune_core::protocol::Protocol;

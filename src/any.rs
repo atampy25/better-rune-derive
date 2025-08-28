@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote, quote_spanned, ToTokens};
 use rune_core::hash::Hash;
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{parse_str, Ident, Token};
-use syn::{punctuated::Punctuated, Type};
 
 use crate::context::{CloneWith, Context, FieldAttrs, Generate, GenerateTarget, Tokens, TypeAttr};
 
@@ -437,7 +437,14 @@ fn expand_enum_install_with(
                         let fields = field_fns.entry(f_name).or_default();
 
                         let access = attrs.clone_with.decorate(tokens, quote!(#f_ident));
-                        fields.push(quote!(#ident::#variant_ident { #f_ident, .. } => #vm_result::Ok(#vm_try!(#to_value::to_value(#access)))));
+                        let ty = &f.ty;
+                        let val = if let Some(as_into) = &attrs.as_into {
+                            quote!(<#as_into as std::convert::From<#ty>>::from(#access))
+                        } else {
+                            quote!(#access)
+                        };
+
+                        fields.push(quote!(#ident::#variant_ident { #f_ident, .. } => #vm_result::Ok(#vm_try!(#to_value::to_value(#val)))));
                     }
                 }
 
@@ -475,7 +482,14 @@ fn expand_enum_install_with(
                         let n = syn::LitInt::new(&n.to_string(), span);
 
                         let access = attrs.clone_with.decorate(tokens, quote!(value));
-                        fields.push(quote!(#ident::#variant_ident { #n: value, .. } => #vm_result::Ok(#vm_try!(#to_value::to_value(#access)))));
+                        let ty = &field.ty;
+                        let val = if let Some(as_into) = &attrs.as_into {
+                            quote!(<#as_into as std::convert::From<#ty>>::from(#access))
+                        } else {
+                            quote!(#access)
+                        };
+
+                        fields.push(quote!(#ident::#variant_ident { #n: value, .. } => #vm_result::Ok(#vm_try!(#to_value::to_value(#val)))));
                     }
                 }
 
